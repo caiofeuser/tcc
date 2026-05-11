@@ -1,0 +1,11 @@
+.git
+.gitignore
+.env
+node_modules
+dist
+logs
+*.log
+.DS_Store
+Dockerfile
+docker-compose.yaml
+README.md

@@ -1,0 +1,37 @@
+services:
+  db:
+    image: pgvector/pgvector:pg18-trixie
+    restart: always
+    environment:
+      POSTGRES_PASSWORD: example
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+  adminer:
+    image: adminer
+    restart: always
+    ports:
+      - "8080:8080"
+  # backend
+  app:
+    build: .
+    depends_on:
+      - db
+    ports:
+      - "3000:3000"
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  postgres_data:
