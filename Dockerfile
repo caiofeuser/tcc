@@ -13,7 +13,10 @@ COPY . .
 # build 
 RUN bun build --compile --minify --sourcemap ./src --outfile hono-docker-app
 
-CMD ["bun", "run", "src/index.ts"]
+RUN bun build --compile --minify --sourcemap ./src/index.ts --outfile hono-docker-app
+
+CMD ["./hono-docker-app"]
+
 
 
 
