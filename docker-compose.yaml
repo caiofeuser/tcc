@@ -2,10 +2,14 @@ services:
   db:
     image: pgvector/pgvector:pg18-trixie
     restart: always
+    ports:
+      # Avoid conflict with host Postgres (often already on 5432).
+      - "5433:5432"
     environment:
       POSTGRES_PASSWORD: example
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql
+
     # deploy:
     #   resources:
     #     reservations:
@@ -21,6 +25,15 @@ services:
   # backend
   app:
     build: .
+    env_file:
+      - .env
+    stdin_open: true
+    tty: true
+    environment:
+      # Inside Compose, Postgres is reachable as service `db`; host tools use localhost:5433.
+      DATABASE_URL: postgres://postgres:example@db:5432/postgres
+      FORCE_COLOR: "1"
+      TERM: xterm-256color
     depends_on:
       - db
     ports:
@@ -32,6 +45,34 @@ services:
     #         - driver: nvidia
     #           count: all
     #           capabilities: [gpu]
+    develop:
+      watch:
+        - action: sync
+          path: .
+          target: /app
+          initial_sync: true
+          ignore:
+            - node_modules/
+            - dist/
+            - .git/
+            - package.json
+            - bun.lock
+            - Dockerfile
+            - tsconfig.json
+
+        - action: sync+restart
+          path: ./tsconfig.json
+          target: /app/tsconfig.json
+          initial_sync: true
+
+        - action: rebuild
+          path: ./package.json
+
+        - action: rebuild
+          path: ./bun.lock
+
+        - action: rebuild
+          path: ./Dockerfile
 
 volumes:
   postgres_data:
