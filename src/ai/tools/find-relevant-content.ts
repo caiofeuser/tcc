@@ -8,7 +8,7 @@ const log = createLogger("api:find-relevant-content");
 
 export async function findRelevantContent(input: string) {
 	const value = input.replace(/\s+/g, " ").trim();
-	const userQueryEmbedded = await generateEmbedding(value); // abc djf -> [0.23,0.32,1,0.65]
+	const userQueryEmbedded = await generateEmbedding(value);
 
 	const distance = cosineDistance(manualChunks.embedding, userQueryEmbedded.embedding);
 	const similarity = sql<number>`1 - (${distance})`;

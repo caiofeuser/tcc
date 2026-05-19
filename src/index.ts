@@ -1,16 +1,16 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import { serve } from "@hono/node-server";
-import { serveStatic } from "@hono/node-server/serve-static";
 import { createLogger } from "@log/index.js";
 import { stepCountIs, streamText, tool } from "ai";
+import { BunSQLPreparedQuery } from "drizzle-orm/bun-sql";
 import { Hono } from "hono";
+import { getBunServer, serveStatic } from "hono/bun";
 import { z } from "zod";
 import { createContext } from "./ai/context/create-context.js";
 import { prepareSession } from "./ai/session/prepare-session.js";
 import { findRelevantContent } from "./ai/tools/find-relevant-content.js";
 import { validate } from "./ai/validation/validate.js";
 
-const app = new Hono();
+const app = new Hono({});
 const log = createLogger("api");
 const chatLog = createLogger("api:chat");
 const ragLog = createLogger("api:rag");
@@ -114,6 +114,7 @@ app.post("/api/ai/chat", async ({ req }) => {
 
 	const result = streamText({
 		model: provider(ctx.data.modelId),
+		temperature: 0,
 		system: systemPrompt,
 		prompt: data.message,
 		stopWhen: stepCountIs(3),
@@ -125,8 +126,7 @@ app.post("/api/ai/chat", async ({ req }) => {
         Use this tool for questions about Epson robot operation, TP3 controls, coordinate movement, setup, modes, warnings, errors, safety, or multi-step procedures.
         
         Do not use it for greetings, app meta questions, or questions that can be answered entirely from the current session/task context.
-        The result contains manual excerpts with page ranges and relevance scores. Use the excerpts as the source of truth and cite page numbers when answering.
-    `,
+        The result contains manual excerpts with page ranges and relevance scores. Use the excerpts as the source of truth and cite page numbers when answering.`,
 				inputSchema: z.object({
 					question: z
 						.string()
@@ -143,10 +143,16 @@ app.post("/api/ai/chat", async ({ req }) => {
 			}),
 		},
 		onStepFinish: (event) => {
-			log.success("Step finished", event);
+			const { model, content, toolCalls } = event;
+			log.success("Step finished", { model, content, toolCalls });
 		},
-		onFinish: () => {
-			log.success("Stream finished");
+		onFinish: ({ content, sources, usage, toolCalls, steps, finishReason, text }) => {
+			log.info("Finish Reason:", { finishReason });
+			log.success("Stream finished:", { content, sources, steps, usage });
+			log.info("Tool calls:", { toolCalls });
+			log.debug("Content:", { content });
+			log.debug("Content:", { text });
+			// const result = await ctx.db.insert()
 		},
 	});
 
@@ -185,26 +191,14 @@ app.post("/api/rag/search", async (c) => {
 	}
 });
 
-const port = Number(process.env.APP_PORT ?? 3000);
-const bunRuntime = (
-	globalThis as typeof globalThis & {
-		Bun?: {
-			serve: (options: { fetch: typeof app.fetch; port: number }) => { port: number };
-		};
-	}
-).Bun;
+const config = {
+	fetch: app.fetch,
+	port: Number(process.env.APP_PORT ?? 3000),
+	idleTimeout: 200,
+} satisfies Bun.Serve.Options<undefined, never>;
 
-if (bunRuntime) {
-	const server = bunRuntime.serve({ fetch: app.fetch, port });
-	log.success("Server started", { runtime: "bun", url: `http://localhost:${server.port}` });
-} else {
-	serve(
-		{
-			fetch: app.fetch,
-			port,
-		},
-		(info) => {
-			log.success("Server started", { runtime: "node", url: `http://localhost:${info.port}` });
-		},
-	);
-}
+const serve = Bun.serve(config);
+
+const { development, port, url } = serve;
+
+log.success("Server started", { development, port, url });
