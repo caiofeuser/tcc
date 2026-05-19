@@ -1,9 +1,8 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { createLogger } from "@log/index.js";
 import { stepCountIs, streamText, tool } from "ai";
-import { BunSQLPreparedQuery } from "drizzle-orm/bun-sql";
 import { Hono } from "hono";
-import { getBunServer, serveStatic } from "hono/bun";
+import { serveStatic } from "hono/bun";
 import { z } from "zod";
 import { createContext } from "./ai/context/create-context.js";
 import { prepareSession } from "./ai/session/prepare-session.js";

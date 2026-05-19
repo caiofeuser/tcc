@@ -5,7 +5,7 @@
 		"strict": true,
 		"verbatimModuleSyntax": true,
 		"skipLibCheck": true,
-		"types": ["node"],
+		"types": ["node", "bun"],
 		"jsx": "react-jsx",
 		"jsxImportSource": "hono/jsx",
     "paths" : {
@@ -16,6 +16,5 @@
     },
     "outDir": "./dist"
 	},
-	"exclude": ["node_modules"],
-  "types": ["node", "bun"]
+	"exclude": ["node_modules"]
 }
