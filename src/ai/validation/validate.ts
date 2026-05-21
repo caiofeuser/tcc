@@ -3,6 +3,8 @@ import { z } from "zod";
 const chatRequestSchema = z.object({
 	session: z.string(),
 	message: z.string().trim().min(1),
+	imageBase64: z.string().trim().min(1).optional(),
+	imageMediaType: z.string().trim().min(1).optional(),
 });
 
 export function validate(req: unknown) {

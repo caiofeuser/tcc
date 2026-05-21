@@ -4,6 +4,7 @@
   "scripts": {
     "dev": "bun --watch src/index.ts",
     "build": "tsc",
+    "typecheck:go": "tsc --noEmit",
     "start": "node dist/index.js",
     "clean": "rm -rf ./assests/images"
   },

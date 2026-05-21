@@ -93,7 +93,7 @@ async function extractImage(pdf: PDFDocumentProxy, pageNumber: number) {
 	return { image: png, title: pageName };
 }
 
-export async function ingestPDF(filePath: string) {
+export async function ingestPDF(filePath: string, dryRun: boolean) {
 	const ingestionTimer = log.timer();
 	log.info("Starting manual ingestion", { file: filePath });
 
@@ -119,7 +119,7 @@ export async function ingestPDF(filePath: string) {
 
 		log.success("Document registered", { documentId: document.id, title });
 
-		for (let pageNumber = 3; pageNumber <= pdf.numPages; pageNumber++) {
+		for (let pageNumber = 18; pageNumber <= pdf.numPages; pageNumber++) {
 			let index = 0;
 			const pageTimer = log.timer();
 			log.info("Processing page", { page: pageNumber, totalPages: pdf.numPages });
@@ -151,19 +151,21 @@ export async function ingestPDF(filePath: string) {
 			const embedding = await generateEmbedding(textContent);
 			log.debug("Embedding generated", { page: pageNumber, tokens: embedding.usage.tokens });
 
-			await ctx.db.insert(manualChunks).values({
-				documentId: document.id,
-				chunkIndex: index,
-				pageStart: pageNumber,
-				pageEnd: pageNumber,
-				content: textContent,
-				metadata: { title },
-				embedding: embedding.embedding,
-				tokenCount: embedding.usage.tokens,
-			});
-			log.info("Writing chunks to database", { chunks: pages.length });
-			pageTimer.done("Page processed", { page: pageNumber, tokens: embedding.usage.tokens });
+			if (!dryRun) {
+				await ctx.db.insert(manualChunks).values({
+					documentId: document.id,
+					chunkIndex: index,
+					pageStart: pageNumber,
+					pageEnd: pageNumber,
+					content: textContent,
+					metadata: { title },
+					embedding: embedding.embedding,
+					tokenCount: embedding.usage.tokens,
+				});
+				log.info("Writing chunks to database", { chunks: pages.length });
+			}
 
+			pageTimer.done("Page processed", { page: pageNumber, tokens: embedding.usage.tokens });
 			index++;
 		}
 
@@ -181,4 +183,4 @@ const buildEmbeddingContent = (text: string, imageCaption: string | undefined) =
 	return imageCaption ? `${mainSection}\n\n${imageSection}` : mainSection;
 };
 
-await ingestPDF(process.argv[2] ?? DEFAULT_MANUAL_PATH);
+await ingestPDF(process.argv[2] ?? DEFAULT_MANUAL_PATH, false);

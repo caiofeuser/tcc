@@ -1,18 +1,116 @@
+import { readFile } from "node:fs/promises";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { createLogger } from "@log/index.js";
-import { stepCountIs, streamText, tool } from "ai";
+import { type ModelMessage, stepCountIs, streamText, type UserContent } from "ai";
 import { Hono } from "hono";
 import { serveStatic } from "hono/bun";
 import { z } from "zod";
 import { createContext } from "./ai/context/create-context.js";
+import { getSessionMessages, persistChatTurn } from "./ai/session/persistence.js";
 import { prepareSession } from "./ai/session/prepare-session.js";
 import { findRelevantContent } from "./ai/tools/find-relevant-content.js";
+import type { PageImageToolOutput } from "./ai/tools/get-image.js";
+import { tools } from "./ai/tools/index.js";
 import { validate } from "./ai/validation/validate.js";
 
 const app = new Hono({});
 const log = createLogger("api");
 const chatLog = createLogger("api:chat");
 const ragLog = createLogger("api:rag");
+const sessionLog = createLogger("api:session");
+
+function normalizeBase64Image(imageBase64: string) {
+	const dataUrlMatch = imageBase64.match(/^data:(?<mediaType>[^;]+);base64,(?<data>.+)$/);
+
+	return {
+		data: dataUrlMatch?.groups?.data ?? imageBase64,
+		mediaType: dataUrlMatch?.groups?.mediaType,
+	};
+}
+
+function jsonSafe(value: unknown) {
+	if (value === undefined) return undefined;
+
+	try {
+		return JSON.parse(JSON.stringify(value));
+	} catch {
+		return String(value);
+	}
+}
+
+function withoutUndefined(metadata: Record<string, unknown>) {
+	return Object.fromEntries(Object.entries(metadata).filter(([, value]) => value !== undefined));
+}
+
+function summarizeToolCalls(toolCalls: readonly unknown[]) {
+	return toolCalls.map((toolCall) => {
+		if (typeof toolCall !== "object" || toolCall === null) {
+			return { value: String(toolCall) };
+		}
+
+		const record = toolCall as Record<string, unknown>;
+
+		return withoutUndefined({
+			toolCallId: record.toolCallId,
+			toolName: record.toolName,
+			input: jsonSafe(record.input ?? record.args),
+		});
+	});
+}
+
+function isPageImageToolOutput(output: unknown): output is PageImageToolOutput {
+	return (
+		typeof output === "object" &&
+		output !== null &&
+		"pageNumber" in output &&
+		"mediaType" in output &&
+		"imagePath" in output &&
+		typeof output.pageNumber === "number" &&
+		output.mediaType === "image/png" &&
+		typeof output.imagePath === "string"
+	);
+}
+
+async function attachRequestedPageImages(
+	messages: ModelMessage[],
+	steps: Array<{ toolResults: Array<{ toolName: string; output: unknown }> }>,
+	attachedPageImageKeys: Set<string>,
+) {
+	const requestedPages: PageImageToolOutput[] = [];
+
+	for (const result of steps.flatMap((step) => step.toolResults)) {
+		if (result.toolName === "getImage" && isPageImageToolOutput(result.output)) {
+			requestedPages.push(result.output);
+		}
+	}
+
+	if (requestedPages.length === 0) return;
+
+	const seen = new Set<string>();
+	const imageMessages: ModelMessage[] = [];
+
+	for (const page of requestedPages) {
+		const key = `${page.pageNumber}:${page.imagePath}`;
+		if (seen.has(key) || attachedPageImageKeys.has(key)) continue;
+
+		seen.add(key);
+		attachedPageImageKeys.add(key);
+		const image = await readFile(page.imagePath);
+
+		imageMessages.push({
+			role: "user",
+			content: [
+				{
+					type: "text",
+					text: `Attached rendered Epson TP3 manual page ${page.pageNumber} requested by getImage. Inspect this image visually before answering if the question depends on layout, diagrams, screenshots, button labels, or screen contents.`,
+				},
+				{ type: "image", image, mediaType: page.mediaType },
+			],
+		});
+	}
+
+	return imageMessages.length > 0 ? [...messages, ...imageMessages] : undefined;
+}
 
 const systemPrompt = `You are a local multimodal assistant for guided Epson robot operation.
 
@@ -67,6 +165,40 @@ app.get("/health", (c) => {
 	return c.json({ status: "ok" });
 });
 
+app.get("/api/sessions/:session/messages", async (c) => {
+	const sessionId = c.req.param("session").trim();
+
+	if (!sessionId) {
+		sessionLog.warn("Session messages requested without session id");
+		return c.json({ error: "Session is required." }, 400);
+	}
+
+	const ctx = createContext();
+
+	if (ctx.error) {
+		const { message, status } = ctx.error;
+		sessionLog.error("Context creation failed", { status, message });
+		return c.json({ error: message }, status);
+	}
+
+	try {
+		const sessionMessages = await getSessionMessages(ctx.db, sessionId);
+		sessionLog.info("Session messages loaded", { sessionId, messages: sessionMessages.length });
+
+		return c.json({
+			session: sessionId,
+			messages: sessionMessages.map((message) => ({
+				...message,
+				createdAt: message.createdAt?.toISOString() ?? null,
+			})),
+		});
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		sessionLog.error("Failed to load session messages", error instanceof Error ? error : new Error(String(error)));
+		return c.json({ error: message }, 500);
+	}
+});
+
 app.post("/api/ai/chat", async ({ req }) => {
 	let rawBody: unknown;
 
@@ -95,14 +227,18 @@ app.post("/api/ai/chat", async ({ req }) => {
 		return new Response(`Bad request: ${message}`, { status });
 	}
 
-	try {
-		await prepareSession(ctx, data);
-		chatLog.debug("Session prepared");
-	} catch (err) {
-		const message = err instanceof Error ? err : new Error(String(err));
-		chatLog.error("Session preparation failed", message);
-		return new Response(`Bad request: ${message}`, { status: 500 });
+	const preparedSession = await prepareSession(ctx, data);
+
+	if (preparedSession.error) {
+		const { message, status } = preparedSession.error;
+		chatLog.error("Session preparation failed", { status, message });
+		return new Response(`Bad request: ${message}`, { status });
 	}
+
+	chatLog.debug("Session prepared", {
+		sessionId: preparedSession.data.sessionId,
+		previousMessages: preparedSession.data.prevMessages.length,
+	});
 
 	const provider = createOpenAICompatible({
 		name: ctx.data.providerName,
@@ -111,47 +247,77 @@ app.post("/api/ai/chat", async ({ req }) => {
 		includeUsage: true,
 	});
 
+	const userContent: Extract<UserContent, unknown[]> = [{ type: "text", text: data.message }];
+	let imageMediaType: string | undefined;
+
+	if (data.imageBase64) {
+		const image = normalizeBase64Image(data.imageBase64);
+		imageMediaType = data.imageMediaType ?? image.mediaType;
+
+		userContent.push({
+			type: "image",
+			image: image.data,
+			mediaType: imageMediaType,
+		});
+	}
+
+	const currentUserMessage: ModelMessage = { role: "user", content: userContent };
+	const attachedPageImageKeys = new Set<string>();
+
 	const result = streamText({
 		model: provider(ctx.data.modelId),
 		temperature: 0,
 		system: systemPrompt,
-		prompt: data.message,
-		stopWhen: stepCountIs(3),
-		tools: {
-			getInformation: tool({
-				description: `
-        Search the Epson TP3 teach pendant manual for grounded technical information.
-        
-        Use this tool for questions about Epson robot operation, TP3 controls, coordinate movement, setup, modes, warnings, errors, safety, or multi-step procedures.
-        
-        Do not use it for greetings, app meta questions, or questions that can be answered entirely from the current session/task context.
-        The result contains manual excerpts with page ranges and relevance scores. Use the excerpts as the source of truth and cite page numbers when answering.`,
-				inputSchema: z.object({
-					question: z
-						.string()
-						.describe(
-							"A focused search query for the Epson TP3 manual. Include the relevant robot operation, TP3 screen/control, error, mode, coordinate movement, or safety topic.",
-						),
-				}),
-				execute: async ({ question }) => {
-					chatLog.info("RAG tool called", { questionLength: question.length });
-					const answer = await findRelevantContent(question);
-					chatLog.success("RAG tool called", { answer });
-					return answer;
-				},
-			}),
+		messages: [...preparedSession.data.prevMessages, currentUserMessage],
+		stopWhen: stepCountIs(4),
+		tools,
+		prepareStep: async ({ messages, steps }) => {
+			const messagesWithImages = await attachRequestedPageImages(messages, steps, attachedPageImageKeys);
+
+			if (!messagesWithImages) return undefined;
+
+			return {
+				messages: messagesWithImages,
+				activeTools: [],
+			};
 		},
 		onStepFinish: (event) => {
 			const { model, content, toolCalls } = event;
 			log.success("Step finished", { model, content, toolCalls });
 		},
-		onFinish: ({ content, sources, usage, toolCalls, steps, finishReason, text }) => {
+		onFinish: async ({ content, sources, usage, totalUsage, toolCalls, steps, finishReason, text }) => {
 			log.info("Finish Reason:", { finishReason });
 			log.success("Stream finished:", { content, sources, steps, usage });
 			log.info("Tool calls:", { toolCalls });
 			log.debug("Content:", { content });
 			log.debug("Content:", { text });
-			// const result = await ctx.db.insert()
+
+			try {
+				await persistChatTurn(ctx.db, {
+					sessionId: preparedSession.data.sessionId,
+					userMessage: data.message,
+					assistantMessage: text,
+					userMetadata: withoutUndefined({
+						hasImage: Boolean(data.imageBase64),
+						imageMediaType: imageMediaType ?? null,
+					}),
+					assistantMetadata: withoutUndefined({
+						finishReason,
+						usage: jsonSafe(usage),
+						totalUsage: jsonSafe(totalUsage),
+						sources: jsonSafe(sources),
+						toolCalls: summarizeToolCalls(toolCalls),
+						stepCount: steps.length,
+					}),
+				});
+
+				chatLog.success("Chat turn persisted", {
+					sessionId: preparedSession.data.sessionId,
+					assistantMessageLength: text.length,
+				});
+			} catch (error) {
+				chatLog.error("Chat turn persistence failed", error instanceof Error ? error : new Error(String(error)));
+			}
 		},
 	});
 
@@ -191,9 +357,17 @@ app.post("/api/rag/search", async (c) => {
 });
 
 const config = {
-	fetch: app.fetch,
+	fetch(req, server) {
+		const path = new URL(req.url).pathname;
+
+		if (path === "/api/ai/chat") {
+			server.timeout(req, 0);
+		}
+
+		return app.fetch(req);
+	},
 	port: Number(process.env.APP_PORT ?? 3000),
-	idleTimeout: 200,
+	idleTimeout: 255,
 } satisfies Bun.Serve.Options<undefined, never>;
 
 const serve = Bun.serve(config);

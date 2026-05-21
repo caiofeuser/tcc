@@ -1,13 +1,14 @@
-import { sessions } from "@db/schema.js";
 import type { ContextType } from "../context/create-context.js";
+import { getSessionMessages, toModelMessages } from "./persistence.js";
 
 export async function prepareSession(ctx: ContextType, { session: sessionId }: { message: string; session: string }) {
 	try {
-		await ctx.db.insert(sessions).values({ id: sessionId }).onConflictDoNothing({ target: sessions.id });
+		const messages = await getSessionMessages(ctx.db, sessionId);
 
 		return {
 			data: {
-				prevMessages: [],
+				messages,
+				prevMessages: toModelMessages(messages),
 				sessionId,
 			},
 			error: null,
