@@ -1,7 +1,8 @@
-import { readFile } from "node:fs/promises";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+import { images } from "@db/schema.js";
 import { createLogger } from "@log/index.js";
 import { type ModelMessage, stepCountIs, streamText, type UserContent } from "ai";
+import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { serveStatic } from "hono/bun";
 import { z } from "zod";
@@ -18,6 +19,8 @@ const log = createLogger("api");
 const chatLog = createLogger("api:chat");
 const ragLog = createLogger("api:rag");
 const sessionLog = createLogger("api:session");
+
+type SelectableDatabase = Pick<ReturnType<typeof createContext>["db"], "select">;
 
 function normalizeBase64Image(imageBase64: string) {
 	const dataUrlMatch = imageBase64.match(/^data:(?<mediaType>[^;]+);base64,(?<data>.+)$/);
@@ -62,16 +65,21 @@ function isPageImageToolOutput(output: unknown): output is PageImageToolOutput {
 	return (
 		typeof output === "object" &&
 		output !== null &&
+		"documentId" in output &&
+		"imageId" in output &&
 		"pageNumber" in output &&
+		"filename" in output &&
 		"mediaType" in output &&
-		"imagePath" in output &&
+		typeof output.documentId === "string" &&
+		typeof output.imageId === "string" &&
 		typeof output.pageNumber === "number" &&
-		output.mediaType === "image/png" &&
-		typeof output.imagePath === "string"
+		typeof output.filename === "string" &&
+		output.mediaType === "image/png"
 	);
 }
 
 async function attachRequestedPageImages(
+	db: SelectableDatabase,
 	messages: ModelMessage[],
 	steps: Array<{ toolResults: Array<{ toolName: string; output: unknown }> }>,
 	attachedPageImageKeys: Set<string>,
@@ -90,21 +98,34 @@ async function attachRequestedPageImages(
 	const imageMessages: ModelMessage[] = [];
 
 	for (const page of requestedPages) {
-		const key = `${page.pageNumber}:${page.imagePath}`;
+		const key = page.imageId;
 		if (seen.has(key) || attachedPageImageKeys.has(key)) continue;
+
+		const [pageImage] = await db
+			.select({
+				data: images.data,
+				mimetype: images.mimetype,
+			})
+			.from(images)
+			.where(eq(images.id, page.imageId))
+			.limit(1);
+
+		if (!pageImage) throw new Error(`Manual page image ${page.imageId} was not found in the database.`);
+		if (pageImage.mimetype !== page.mediaType) {
+			throw new Error(`Manual page image ${page.imageId} has unexpected type ${pageImage.mimetype}.`);
+		}
 
 		seen.add(key);
 		attachedPageImageKeys.add(key);
-		const image = await readFile(page.imagePath);
 
 		imageMessages.push({
 			role: "user",
 			content: [
 				{
 					type: "text",
-					text: `Attached rendered Epson TP3 manual page ${page.pageNumber} requested by getImage. Inspect this image visually before answering if the question depends on layout, diagrams, screenshots, button labels, or screen contents.`,
+					text: `Attached rendered Epson TP3 manual page ${page.pageNumber} requested by getImage from the database. Inspect this image visually before answering if the question depends on layout, diagrams, screenshots, button labels, or screen contents.`,
 				},
-				{ type: "image", image, mediaType: page.mediaType },
+				{ type: "image", image: pageImage.data, mediaType: page.mediaType },
 			],
 		});
 	}
@@ -272,7 +293,7 @@ app.post("/api/ai/chat", async ({ req }) => {
 		stopWhen: stepCountIs(4),
 		tools,
 		prepareStep: async ({ messages, steps }) => {
-			const messagesWithImages = await attachRequestedPageImages(messages, steps, attachedPageImageKeys);
+			const messagesWithImages = await attachRequestedPageImages(ctx.db, messages, steps, attachedPageImageKeys);
 
 			if (!messagesWithImages) return undefined;
 

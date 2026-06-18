@@ -20,9 +20,11 @@ export async function findRelevantContent(input: string) {
 	const chunks = await db
 		.select({
 			id: manualChunks.id,
+			documentId: manualChunks.documentId,
 			content: manualChunks.content,
 			pageStart: manualChunks.pageStart,
 			pageEnd: manualChunks.pageEnd,
+			metadata: manualChunks.metadata,
 			similarity,
 		})
 		.from(manualChunks)
@@ -34,8 +36,13 @@ export async function findRelevantContent(input: string) {
 
 	return chunks.map((chunk) => ({
 		id: chunk.id,
+		documentId: chunk.documentId,
 		source: "Epson TP3 manual for RC700A controller",
 		pageRange: chunk.pageStart === chunk.pageEnd ? `p. ${chunk.pageStart}` : `pp. ${chunk.pageStart}-${chunk.pageEnd}`,
+		imageId:
+			chunk.metadata && "imageId" in chunk.metadata && typeof chunk.metadata.imageId === "string"
+				? chunk.metadata.imageId
+				: null,
 		relevance: Number(chunk.similarity.toFixed(3)),
 		excerpt: chunk.content,
 	}));
@@ -48,7 +55,7 @@ export const getInformationTool = tool({
     Use this tool for questions about Epson robot operation, TP3 controls, coordinate movement, setup, modes, warnings, errors, safety, or multi-step procedures.
     
     Do not use it for greetings, app meta questions, or questions that can be answered entirely from the current session/task context.
-    The result contains manual excerpts with page ranges and relevance scores. Use the excerpts as the source of truth and cite page numbers when answering.`,
+    The result contains manual excerpts with page ranges, relevance scores, and database IDs for related document/page images. Use the excerpts as the source of truth and cite page numbers when answering.`,
 	inputSchema: z.object({
 		question: z
 			.string()

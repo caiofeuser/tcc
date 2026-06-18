@@ -49,15 +49,6 @@ export const messages = p.pgTable("messages", {
 	...temporals,
 });
 
-// not sure if this will work tho
-export const images = p.pgTable("images", {
-	...id,
-	filename: p.text().notNull(),
-	mimetype: p.text().notNull(),
-	data: binary().notNull(),
-	...temporals,
-});
-
 /* -------------- rag's schemas -------------- */
 export const manualDocuments = p.pgTable("manual_documents", {
 	...id,
@@ -66,6 +57,24 @@ export const manualDocuments = p.pgTable("manual_documents", {
 	sourceType: p.text("source_type"),
 	...temporals,
 });
+
+export const images = p.pgTable(
+	"images",
+	{
+		...id,
+		documentId: p
+			.varchar("document_id")
+			.notNull()
+			.references(() => manualDocuments.id, { onDelete: "cascade" }),
+		pageNumber: p.integer("page_number").notNull(),
+		filename: p.text().notNull(),
+		mimetype: p.text().notNull(),
+		data: binary().notNull(),
+		metadata: p.jsonb().$type<Record<string, unknown>>().default({}),
+		...temporals,
+	},
+	(table) => [p.uniqueIndex("images_document_page_idx").on(table.documentId, table.pageNumber)],
+);
 
 export const manualChunks = p.pgTable(
 	"manual_chunks",

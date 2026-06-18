@@ -1,5 +1,5 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { manualChunks, manualDocuments } from "@db/schema.js";
+import { images, manualChunks, manualDocuments } from "@db/schema.js";
 import { createLogger } from "@log/index.js";
 import { getDocument, type PDFDocumentProxy } from "pdfjs-dist/legacy/build/pdf.mjs";
 import type { TextContent } from "pdfjs-dist/types/src/display/api.js";
@@ -84,13 +84,13 @@ async function extractImage(pdf: PDFDocumentProxy, pageNumber: number) {
 
 	await mkdir(OUTPUT, { recursive: true });
 
-	const pageName = `page-${String(page.pageNumber).padStart(3, "0")}.png`;
-	const path = `${OUTPUT}/${pageName}`;
+	const filename = `page-${String(page.pageNumber).padStart(3, "0")}.png`;
+	const path = `${OUTPUT}/${filename}`;
 
 	const png = entry.canvas.toBuffer("image/png");
 	await writeFile(path, png);
 
-	return { image: png, title: pageName };
+	return { filename, image: png };
 }
 
 export async function ingestPDF(filePath: string, dryRun: boolean) {
@@ -119,7 +119,7 @@ export async function ingestPDF(filePath: string, dryRun: boolean) {
 
 		log.success("Document registered", { documentId: document.id, title });
 
-		for (let pageNumber = 18; pageNumber <= pdf.numPages; pageNumber++) {
+		for (let pageNumber = 34; pageNumber <= pdf.numPages; pageNumber++) {
 			let index = 0;
 			const pageTimer = log.timer();
 			log.info("Processing page", { page: pageNumber, totalPages: pdf.numPages });
@@ -129,9 +129,9 @@ export async function ingestPDF(filePath: string, dryRun: boolean) {
 			log.debug("Page text extracted", { page: pageNumber, chars: text.length });
 
 			const { next, prev } = await getAuxiliaryContent(pageNumber, pdf);
-			const { image, title } = await extractImage(pdf, pageNumber);
+			const { filename, image } = await extractImage(pdf, pageNumber);
 			const wholeText = [prev, text, next].join("\n");
-			log.debug("Page image rendered", { page: pageNumber, file: title, bytes: image.byteLength });
+			log.debug("Page image rendered", { page: pageNumber, file: filename, bytes: image.byteLength });
 
 			const caption = await imageCaptionGenerator({
 				pageNumber,
@@ -152,13 +152,30 @@ export async function ingestPDF(filePath: string, dryRun: boolean) {
 			log.debug("Embedding generated", { page: pageNumber, tokens: embedding.usage.tokens });
 
 			if (!dryRun) {
+				const [pageImage] = await ctx.db
+					.insert(images)
+					.values({
+						documentId: document.id,
+						pageNumber,
+						filename,
+						mimetype: "image/png",
+						data: image,
+						metadata: {
+							sourcePath: filePath,
+							renderedScale: 2,
+						},
+					})
+					.returning({ id: images.id });
+
+				if (!pageImage) throw new Error(`Could not create image record for page ${pageNumber}.`);
+
 				await ctx.db.insert(manualChunks).values({
 					documentId: document.id,
 					chunkIndex: index,
 					pageStart: pageNumber,
 					pageEnd: pageNumber,
 					content: textContent,
-					metadata: { title },
+					metadata: { imageId: pageImage.id, imageFilename: filename },
 					embedding: embedding.embedding,
 					tokenCount: embedding.usage.tokens,
 				});
