@@ -1,3 +1,5 @@
+USE BUN NOT PNPM!
+
 # TCC Agent Instructions
 
 - Keep responses concise, but explain technical reasoning clearly.

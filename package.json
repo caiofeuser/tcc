@@ -13,6 +13,7 @@
     "@hono/node-server": "^1.19.14",
     "@langchain/textsplitters": "^1.0.1",
     "ai": "^6.0.177",
+    "dedent": "^1.7.2",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
     "hono": "^4.12.18",

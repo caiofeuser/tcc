@@ -53,9 +53,13 @@ export const getInformationTool = tool({
     Search the Epson TP3 teach pendant manual for grounded technical information.
     
     Use this tool for questions about Epson robot operation, TP3 controls, coordinate movement, setup, modes, warnings, errors, safety, or multi-step procedures.
+
+    After this tool returns manual context, use that context to decide the response path:
+    - For simple one-step or factual questions, answer concisely with grounded citations.
+    - For robot/TP3 operations that require two or more ordered operator actions, call startGuidedProcedure next and populate its operatorActions from the retrieved context. Do not write the procedure in text first.
     
     Do not use it for greetings, app meta questions, or questions that can be answered entirely from the current session/task context.
-    The result contains manual excerpts with page ranges, relevance scores, and database IDs for related document/page images. Use the excerpts as the source of truth and cite page numbers when answering.`,
+    The result contains manual excerpts with page ranges, relevance scores, and database IDs for related document/page images. Use the excerpts as the source of truth for either answering simple questions or starting a guided procedure.`,
 	inputSchema: z.object({
 		question: z
 			.string()
@@ -67,6 +71,11 @@ export const getInformationTool = tool({
 		toolLog.info("RAG tool called", { questionLength: question.length });
 		const answer = await findRelevantContent(question);
 		toolLog.success("RAG tool called", { answer });
-		return answer;
+
+		return {
+			manualContext: answer,
+			nextActionReminder:
+				"If this manual context contains two or more ordered operator actions for a robot/TP3 operation, do not answer with procedure text. Call startGuidedProcedure next and populate operatorActions from the retrieved context.",
+		};
 	},
 });

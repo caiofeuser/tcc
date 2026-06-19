@@ -156,6 +156,101 @@
       background: #f8fafb;
     }
 
+    .checklist-panel {
+      display: grid;
+      gap: 12px;
+      padding: 12px;
+      border: 1px solid #d3dbe3;
+      border-radius: 8px;
+      background: #fbfcfd;
+    }
+
+    .checklist-panel[hidden] {
+      display: none;
+    }
+
+    .checklist-topline,
+    .checklist-current-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .checklist-title {
+      margin: 0;
+      color: #18212f;
+      font-size: 15px;
+      font-weight: 650;
+    }
+
+    .checklist-progress,
+    .checklist-status {
+      color: #627084;
+      font-size: 12px;
+    }
+
+    .checklist-current {
+      display: grid;
+      gap: 6px;
+      padding: 10px 12px;
+      border-left: 3px solid #1f4f8f;
+      background: #eef6ff;
+    }
+
+    .checklist-current-title {
+      font-weight: 650;
+    }
+
+    .checklist-current-description {
+      color: #405066;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+
+    .checklist-tasks {
+
+      display: grid;
+      gap: 6px;
+      max-height: 220px;
+      margin: 0;
+      padding: 0;
+      overflow: auto;
+      list-style: none;
+    }
+
+    .checklist-task {
+      display: grid;
+      grid-template-columns: 28px minmax(0, 1fr);
+      gap: 8px;
+      align-items: start;
+      padding: 8px 10px;
+      border: 1px solid #d7dee6;
+      border-radius: 6px;
+      background: #ffffff;
+    }
+
+    .checklist-task.current {
+      border-color: #9fc1ea;
+      background: #f3f8ff;
+    }
+
+    .checklist-task-marker {
+      white-space: nowrap;
+      color: #526070;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .checklist-task-title {
+      font-weight: 650;
+    }
+
+    .checklist-task-description {
+      color: #526070;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+
     .message {
       display: grid;
       gap: 6px;
@@ -190,9 +285,42 @@
     }
 
     .message-body {
+      display: grid;
+      gap: 8px;
+    }
+
+    .message-text,
+    .message-reasoning-content {
       white-space: pre-wrap;
       word-break: break-word;
       line-height: 1.45;
+    }
+
+    .message-reasoning-section {
+      display: grid;
+      gap: 4px;
+    }
+
+    .message-reasoning-section[hidden] {
+      display: none;
+    }
+
+    .message-reasoning-title {
+      color: #627084;
+      font-size: 12px;
+      font-weight: 650;
+      letter-spacing: 0;
+    }
+
+    .message-reasoning-content {
+      max-height: 220px;
+      overflow: auto;
+      border-left: 3px solid #8294aa;
+      border-radius: 6px;
+      padding: 8px 10px;
+      background: #f1f5f7;
+      color: #405066;
+      font-size: 13px;
     }
 
     .empty {
@@ -216,6 +344,7 @@
     }
 
     @media (max-width: 640px) {
+
       header,
       .session-row {
         align-items: stretch;
@@ -254,6 +383,29 @@
 
       <div class="transcript" id="transcript" aria-live="polite"></div>
 
+      <section class="checklist-panel" id="checklist-panel" hidden>
+        <div class="checklist-topline">
+          <h2 class="checklist-title" id="checklist-title">Checklist</h2>
+          <div class="checklist-progress" id="checklist-progress"></div>
+        </div>
+
+        <div class="checklist-current">
+          <div class="checklist-current-head">
+            <div class="checklist-current-title" id="checklist-current-title"></div>
+            <div class="checklist-status" id="checklist-status"></div>
+          </div>
+          <div class="checklist-current-description" id="checklist-current-description"></div>
+        </div>
+
+        <ol class="checklist-tasks" id="checklist-tasks"></ol>
+
+        <div class="actions">
+          <button id="checklist-complete">Complete</button>
+          <button class="secondary" id="checklist-skip">Skip</button>
+          <button class="secondary" id="checklist-reset">Reset</button>
+        </div>
+      </section>
+
       <label>
         Message
         <textarea id="message">How do I move the Epson robot arm to a coordinate?</textarea>
@@ -279,7 +431,18 @@
     const diagnosticsEl = document.querySelector("#diagnostics");
     const messageEl = document.querySelector("#message");
     const sessionEl = document.querySelector("#session");
+    const checklistPanelEl = document.querySelector("#checklist-panel");
+    const checklistTitleEl = document.querySelector("#checklist-title");
+    const checklistProgressEl = document.querySelector("#checklist-progress");
+    const checklistStatusEl = document.querySelector("#checklist-status");
+    const checklistCurrentTitleEl = document.querySelector("#checklist-current-title");
+    const checklistCurrentDescriptionEl = document.querySelector("#checklist-current-description");
+    const checklistTasksEl = document.querySelector("#checklist-tasks");
+    const checklistCompleteEl = document.querySelector("#checklist-complete");
+    const checklistSkipEl = document.querySelector("#checklist-skip");
+    const checklistResetEl = document.querySelector("#checklist-reset");
     const buttons = Array.from(document.querySelectorAll("button"));
+    let currentChecklist = null;
 
     const storedSession = localStorage.getItem("tcc-session-id");
     const sessionId = storedSession || crypto.randomUUID();
@@ -294,6 +457,13 @@
     function setBusy(isBusy, label = "Idle") {
       statusEl.textContent = label;
       for (const button of buttons) button.disabled = isBusy;
+
+      if (!isBusy) {
+        const canAdvance = currentChecklist?.status === "active" && Boolean(currentChecklist.currentTask);
+        checklistCompleteEl.disabled = !canAdvance;
+        checklistSkipEl.disabled = !canAdvance;
+        checklistResetEl.disabled = !currentChecklist;
+      }
     }
 
     function writeDiagnostic(value) {
@@ -312,6 +482,201 @@
       });
     }
 
+    function markerForTask(task) {
+      if (task.status === "completed") return "x";
+      if (task.status === "skipped") return "-";
+      return " ";
+    }
+
+    function renderChecklist(checklist) {
+      currentChecklist = checklist;
+      checklistTasksEl.textContent = "";
+
+      if (!checklist) {
+        checklistPanelEl.hidden = true;
+        return;
+      }
+
+      checklistPanelEl.hidden = false;
+      checklistTitleEl.textContent = checklist.title;
+      checklistStatusEl.textContent = checklist.status;
+      checklistProgressEl.textContent = `${checklist.progress.completed}/${checklist.progress.total} completed, ${checklist.progress.skipped} skipped`;
+
+      const currentTask = checklist.currentTask;
+      checklistCurrentTitleEl.textContent = currentTask
+        ? `${currentTask.position + 1}. ${currentTask.title}`
+        : "No pending task";
+      checklistCurrentDescriptionEl.textContent = currentTask
+        ? currentTask.description
+        : checklist.status === "completed"
+          ? "Checklist completed."
+          : "No task is currently selected.";
+
+      for (const task of checklist.tasks) {
+        const item = document.createElement("li");
+        item.className = `checklist-task ${currentTask?.id === task.id ? "current" : ""}`;
+
+        const marker = document.createElement("div");
+        marker.className = "checklist-task-marker";
+        marker.textContent = `[${markerForTask(task)}]`;
+
+        const content = document.createElement("div");
+
+        const title = document.createElement("div");
+        title.className = "checklist-task-title";
+        title.textContent = `${task.position + 1}. ${task.title}`;
+
+        const description = document.createElement("div");
+        description.className = "checklist-task-description";
+        description.textContent = task.description;
+
+        content.append(title, description);
+        item.append(marker, content);
+        checklistTasksEl.append(item);
+      }
+
+      const canAdvance = checklist.status === "active" && Boolean(currentTask);
+      checklistCompleteEl.disabled = !canAdvance;
+      checklistSkipEl.disabled = !canAdvance;
+      checklistResetEl.disabled = false;
+    }
+
+    async function readJsonPayload(response) {
+      const text = await response.text();
+      if (!text) return null;
+      return JSON.parse(text);
+    }
+
+    async function loadChecklist({ silent = false } = {}) {
+      const session = currentSession();
+
+      if (!session) {
+        renderChecklist(null);
+        return;
+      }
+
+      if (!silent) setBusy(true, "Loading");
+
+      try {
+        const response = await fetch(`/api/sessions/${encodeURIComponent(session)}/checklist`);
+        const payload = await readJsonPayload(response);
+
+        if (!response.ok) {
+          writeDiagnostic(JSON.stringify(payload, null, 2));
+          renderChecklist(null);
+          return;
+        }
+
+        renderChecklist(payload.checklist);
+      } catch (error) {
+        writeDiagnostic(String(error));
+        renderChecklist(null);
+      } finally {
+        if (!silent) setBusy(false);
+      }
+    }
+
+    async function postChecklistAction(path, label) {
+      const session = currentSession();
+
+      if (!session) return;
+
+      setBusy(true, label);
+
+      try {
+        const response = await fetch(path, { method: "POST" });
+        const payload = await readJsonPayload(response);
+
+        if (!response.ok) {
+          writeDiagnostic(JSON.stringify(payload, null, 2));
+          return;
+        }
+
+        renderChecklist(payload.checklist);
+        writeDiagnostic(JSON.stringify(payload, null, 2));
+      } catch (error) {
+        writeDiagnostic(String(error));
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    function createReasoningSection() {
+      const section = document.createElement("section");
+      section.className = "message-reasoning-section";
+      section.hidden = true;
+
+      const heading = document.createElement("div");
+      heading.className = "message-reasoning-title";
+      heading.textContent = "Reasoning";
+
+      const content = document.createElement("div");
+      content.className = "message-reasoning-content";
+
+      section.append(heading, content);
+      return { section, content };
+    }
+
+    function setMessageContent(view, text) {
+      view.plain.textContent = text;
+    }
+
+    function setReasoningContent(view, text) {
+      if (!view.reasoning) return;
+
+      view.reasoning.section.hidden = !text;
+      view.reasoning.content.textContent = text;
+    }
+
+    function readUiMessageStreamEvents(buffer, flush = false) {
+      const events = [];
+      let source = flush && buffer.trim() ? `${buffer}\n\n` : buffer;
+
+      while (true) {
+        const separator = /\r?\n\r?\n/.exec(source);
+        if (!separator) break;
+
+        const rawEvent = source.slice(0, separator.index);
+        source = source.slice(separator.index + separator[0].length);
+
+        const data = rawEvent
+          .split(/\r?\n/)
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trimStart())
+          .join("\n");
+
+        if (!data || data === "[DONE]") continue;
+
+        try {
+          events.push(JSON.parse(data));
+        } catch {
+          appendDiagnostic(`\n\nUnparsed stream event:\n${data}`);
+        }
+      }
+
+      return { events, buffer: source };
+    }
+
+    function applyUiMessageStreamEvent(event, state, assistantView) {
+      switch (event.type) {
+        case "reasoning-delta": {
+          state.reasoning += event.delta || event.text || "";
+          setReasoningContent(assistantView, state.reasoning);
+          return;
+        }
+        case "text-delta": {
+          state.answer += event.delta || event.text || "";
+          setMessageContent(assistantView, state.answer);
+          return;
+        }
+        case "error": {
+          const message = event.errorText || event.message || "Stream error";
+          setMessageContent(assistantView, message);
+          assistantView.node.classList.add("error");
+        }
+      }
+    }
+
     function createMessageElement(message, pending = false) {
       const node = document.createElement("article");
       node.className = `message ${message.role}`;
@@ -327,12 +692,22 @@
 
       const body = document.createElement("div");
       body.className = "message-body";
-      body.textContent = message.content || "";
+
+      const plain = document.createElement("div");
+      plain.className = "message-text";
+      body.append(plain);
+
+      const reasoning = message.role === "assistant" ? createReasoningSection() : null;
+
+      if (reasoning) body.prepend(reasoning.section);
 
       meta.append(role, time);
       node.append(meta, body);
 
-      return { node, body, time };
+      const view = { node, body, time, role: message.role, plain, reasoning };
+      setMessageContent(view, message.content || "");
+
+      return view;
     }
 
     function scrollTranscript() {
@@ -411,6 +786,7 @@
       localStorage.setItem("tcc-session-id", nextSession);
       writeDiagnostic("Streaming assistant response...");
       renderMessages([]);
+      renderChecklist(null);
       statusEl.textContent = "New session";
     }
 
@@ -419,10 +795,12 @@
       sessionEl.value = nextSession;
       localStorage.setItem("tcc-session-id", nextSession);
       void loadMessages();
+      void loadChecklist();
     });
 
     document.querySelector("#reload").addEventListener("click", () => {
       void loadMessages();
+      void loadChecklist();
     });
 
     document.querySelector("#reset-session").addEventListener("click", () => {
@@ -457,6 +835,23 @@
       }
     });
 
+    checklistCompleteEl.addEventListener("click", () => {
+      const taskId = currentChecklist?.currentTask?.id || "current";
+      const session = encodeURIComponent(currentSession());
+      void postChecklistAction(`/api/sessions/${session}/checklist/tasks/${encodeURIComponent(taskId)}/complete`, "Completing");
+    });
+
+    checklistSkipEl.addEventListener("click", () => {
+      const taskId = currentChecklist?.currentTask?.id || "current";
+      const session = encodeURIComponent(currentSession());
+      void postChecklistAction(`/api/sessions/${session}/checklist/tasks/${encodeURIComponent(taskId)}/skip`, "Skipping");
+    });
+
+    checklistResetEl.addEventListener("click", () => {
+      const session = encodeURIComponent(currentSession());
+      void postChecklistAction(`/api/sessions/${session}/checklist/reset`, "Resetting");
+    });
+
     document.querySelector("#ask").addEventListener("click", async () => {
       const message = messageEl.value.trim();
       const session = currentSession() || crypto.randomUUID();
@@ -483,8 +878,6 @@
         true,
       );
 
-      let completed = false;
-
       try {
         const response = await fetch("/api/ai/chat", {
           method: "POST",
@@ -497,7 +890,7 @@
 
         if (!response.ok || !response.body) {
           const errorText = await response.text();
-          assistantView.body.textContent = errorText;
+          setMessageContent(assistantView, errorText);
           assistantView.node.classList.add("error");
           writeDiagnostic(errorText);
           return;
@@ -505,32 +898,40 @@
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
-        let assistantText = "";
+        const streamState = { answer: "", reasoning: "" };
+        let streamBuffer = "";
 
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
 
-          assistantText += decoder.decode(value, { stream: true });
-          assistantView.body.textContent = assistantText;
+          streamBuffer += decoder.decode(value, { stream: true });
+          const parsed = readUiMessageStreamEvents(streamBuffer);
+          streamBuffer = parsed.buffer;
+
+          for (const event of parsed.events) {
+            applyUiMessageStreamEvent(event, streamState, assistantView);
+          }
+
           scrollTranscript();
         }
 
         const remainder = decoder.decode();
-        if (remainder) {
-          assistantText += remainder;
-          assistantView.body.textContent = assistantText;
+        streamBuffer += remainder;
+
+        const parsed = readUiMessageStreamEvents(streamBuffer, true);
+        for (const event of parsed.events) {
+          applyUiMessageStreamEvent(event, streamState, assistantView);
         }
 
-        writeDiagnostic(assistantText || "No assistant text returned.");
+        writeDiagnostic(streamState.answer || "No assistant text returned.");
         assistantView.time.textContent = formatTime(new Date().toISOString());
-        completed = true;
       } catch (error) {
-        assistantView.body.textContent = String(error);
+        setMessageContent(assistantView, String(error));
         assistantView.node.classList.add("error");
         writeDiagnostic(String(error));
       } finally {
-        if (completed) await loadMessages({ silent: true });
+        await loadChecklist({ silent: true });
         setBusy(false);
       }
     });
@@ -546,6 +947,7 @@
     });
 
     void loadMessages();
+    void loadChecklist({ silent: true });
   </script>
 </body>
 

@@ -2,16 +2,27 @@ import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { images } from "@db/schema.js";
 import { createLogger } from "@log/index.js";
 import { type ModelMessage, stepCountIs, streamText, type UserContent } from "ai";
+import dedent from "dedent";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { serveStatic } from "hono/bun";
 import { z } from "zod";
+import {
+	abandonChecklist,
+	type ChecklistErrorStatus,
+	ChecklistStateError,
+	completeChecklistTask,
+	formatChecklistForPrompt,
+	getSessionChecklist,
+	resetChecklist,
+	skipChecklistTask,
+} from "./ai/checklists/persistence.js";
 import { createContext } from "./ai/context/create-context.js";
 import { getSessionMessages, persistChatTurn } from "./ai/session/persistence.js";
 import { prepareSession } from "./ai/session/prepare-session.js";
 import { findRelevantContent } from "./ai/tools/find-relevant-content.js";
 import type { PageImageToolOutput } from "./ai/tools/get-image.js";
-import { tools } from "./ai/tools/index.js";
+import { createTools } from "./ai/tools/index.js";
 import { validate } from "./ai/validation/validate.js";
 
 const app = new Hono({});
@@ -19,6 +30,7 @@ const log = createLogger("api");
 const chatLog = createLogger("api:chat");
 const ragLog = createLogger("api:rag");
 const sessionLog = createLogger("api:session");
+const checklistLog = createLogger("api:checklist");
 
 type SelectableDatabase = Pick<ReturnType<typeof createContext>["db"], "select">;
 
@@ -59,6 +71,86 @@ function summarizeToolCalls(toolCalls: readonly unknown[]) {
 			input: jsonSafe(record.input ?? record.args),
 		});
 	});
+}
+
+function summarizeToolOutput(output: unknown) {
+	if (Array.isArray(output)) return { type: "array", items: output.length };
+	if (output === null) return { type: "null" };
+	if (typeof output !== "object") return { type: typeof output };
+
+	return {
+		type: "object",
+		keys: Object.keys(output).slice(0, 10),
+	};
+}
+
+function createStreamHeartbeat(sessionId: string) {
+	const trace = {
+		startedAt: performance.now(),
+		lastEvent: "stream-created",
+		stepNumber: undefined as number | undefined,
+		chunks: 0,
+		textChars: 0,
+		reasoningChars: 0,
+		toolCalls: 0,
+		toolExecutions: 0,
+	};
+	let timer: ReturnType<typeof setInterval> | undefined;
+
+	const elapsedMs = () => Math.round(performance.now() - trace.startedAt);
+
+	return {
+		start: () => {
+			if (timer) return;
+
+			timer = setInterval(() => {
+				chatLog.info("AI stream heartbeat", {
+					sessionId,
+					elapsedMs: elapsedMs(),
+					lastEvent: trace.lastEvent,
+					stepNumber: trace.stepNumber,
+					chunks: trace.chunks,
+					textChars: trace.textChars,
+					reasoningChars: trace.reasoningChars,
+					toolCalls: trace.toolCalls,
+					toolExecutions: trace.toolExecutions,
+				});
+			}, 5000);
+		},
+		stop: () => {
+			if (!timer) return;
+
+			clearInterval(timer);
+			timer = undefined;
+		},
+		mark: (lastEvent: string) => {
+			trace.lastEvent = lastEvent;
+		},
+		stepStarted: (stepNumber: number) => {
+			trace.lastEvent = "step-start";
+			trace.stepNumber = stepNumber;
+		},
+		chunkReceived: () => {
+			trace.chunks += 1;
+		},
+		textDelta: (chars: number) => {
+			trace.lastEvent = "text-delta";
+			trace.textChars += chars;
+		},
+		reasoningDelta: (chars: number) => {
+			trace.lastEvent = "reasoning-delta";
+			trace.reasoningChars += chars;
+		},
+		toolCallEmitted: () => {
+			trace.lastEvent = "tool-call";
+			trace.toolCalls += 1;
+		},
+		toolExecutionStarted: () => {
+			trace.lastEvent = "tool-start";
+			trace.toolExecutions += 1;
+		},
+		elapsedMs,
+	};
 }
 
 function isPageImageToolOutput(output: unknown): output is PageImageToolOutput {
@@ -133,26 +225,45 @@ async function attachRequestedPageImages(
 	return imageMessages.length > 0 ? [...messages, ...imageMessages] : undefined;
 }
 
-const systemPrompt = `You are a local multimodal assistant for guided Epson robot operation.
+const systemPrompt = dedent(`
+  You are a local multimodal assistant for guided Epson robot operation.
 
-Your role is to help an operator use the EPSON T6-B602S robot with the Epson TP3 teach pendant, with short, grounded, task-focused answers.
+  You help an operator use the EPSON T6-B602S robot with the Epson TP3 teach pendant.
 
-Use available session context before answering when it is provided.
+  Core rule:
+  - If the operator asks and the answer is simple, answer it.
+  - If the operator asks and the answer is a multi-step robot/TP3 procedure, start a backend-owned guided procedure.
 
-Retrieval rules:
-- Skip retrieval only for simple questions that do not depend on the robot manual, safety, setup, errors, coordinates, TP3 controls, or the current robot task.
-- For any robot operation, TP3 usage, coordinate movement, setup, error, procedure, safety, or "what should I do next" question, call getInformation before answering.
-- If retrieved context is missing, weak, or unrelated, say that clearly instead of inventing instructions.
+  Retrieval:
+  - For robot operation, TP3 usage, coordinate movement, setup, errors, safety, or procedures, call getInformation first.
+  - If retrieved context is missing, weak, or unrelated, say that clearly or ask one focused clarification question.
 
-Procedure rules:
-- Do not invent procedural or safety-critical robot instructions.
-- If the operator asks for a task that requires multiple ordered actions, give only a concise grounded plan or the next safe step.
-- If required information is missing, ask one focused clarification question.
+  Guided procedure decision:
+  - A guided procedure is required whenever the answer would contain two or more ordered operator actions.
+  - This includes requests such as moving to a coordinate, teaching/recording a point, jogging the robot, setup, calibration, configuration, or "what should I do next" when no active guided procedure exists.
+  - Simple definitions, button explanations, one-step answers do not need a guided procedure.
 
-Answer style:
-- Be concise and operational.
-- Prefer direct steps over explanation.
-- Mention uncertainty when it affects safety or correctness.`;
+  Guided procedure flow:
+  1. First gather needed manual context with getInformation.
+  2. After receiving the retrieved manual context, decide whether the answer requires two or more ordered operator actions.
+  3. If it is multi-step, do not output the procedure as text, bullets, numbered actions, or operator instructions.
+  4. If it is multi-step, only call startGuidedProcedure with operatorActions grounded in the retrieved context.
+  5. After startGuidedProcedure succeeds, only tell the operator that the guided procedure was started and state the current first action.
+
+  Post-retrieval rule:
+  - After getInformation returns, if the operator is asking how to do a robot/TP3 operation and the retrieved context contains multiple ordered actions, your next assistant action must be startGuidedProcedure.
+  - In that case, do not produce natural-language procedure text before calling startGuidedProcedure.
+
+  Active guided procedure:
+  - If an active guided procedure exists, use it as the source of task state.
+  - Do not advance, skip, reset, or complete actions in text. The backend/UI owns progression.
+
+  Answer style:
+  - Be concise, grounded, and operational.
+  - Mention uncertainty when it affects safety or correctness.
+
+  # IMPORTANT!!!
+  - If your final answer would describe a multi-action procedure, do not write that procedure in text. Call startGuidedProcedure instead.`);
 
 app.use(async (c, next) => {
 	const path = new URL(c.req.url).pathname;
@@ -220,6 +331,150 @@ app.get("/api/sessions/:session/messages", async (c) => {
 	}
 });
 
+function checklistError(error: unknown): { message: string; status: ChecklistErrorStatus } {
+	if (error instanceof ChecklistStateError) {
+		return { message: error.message, status: error.status };
+	}
+
+	return {
+		message: error instanceof Error ? error.message : String(error),
+		status: 500,
+	};
+}
+
+app.get("/api/sessions/:session/checklist", async (c) => {
+	const sessionId = c.req.param("session").trim();
+
+	if (!sessionId) {
+		checklistLog.warn("Checklist requested without session id");
+		return c.json({ error: "Session is required." }, 400);
+	}
+
+	const ctx = createContext();
+
+	if (ctx.error) {
+		const { message, status } = ctx.error;
+		checklistLog.error("Context creation failed", { status, message });
+		return c.json({ error: message }, status);
+	}
+
+	try {
+		const checklist = await getSessionChecklist(ctx.db, sessionId);
+		checklistLog.info("Checklist loaded", { sessionId, checklistId: checklist?.id });
+		return c.json({ session: sessionId, checklist });
+	} catch (error) {
+		const { message, status } = checklistError(error);
+		checklistLog.error("Checklist load failed", error instanceof Error ? error : new Error(String(error)));
+		return c.json({ error: message }, status);
+	}
+});
+
+app.post("/api/sessions/:session/checklist/tasks/:task/complete", async (c) => {
+	const sessionId = c.req.param("session").trim();
+	const taskId = c.req.param("task").trim();
+
+	if (!sessionId || !taskId) {
+		return c.json({ error: "Session and task are required." }, 400);
+	}
+
+	const ctx = createContext();
+
+	if (ctx.error) {
+		const { message, status } = ctx.error;
+		checklistLog.error("Context creation failed", { status, message });
+		return c.json({ error: message }, status);
+	}
+
+	try {
+		const checklist = await completeChecklistTask(ctx.db, sessionId, taskId);
+		checklistLog.success("Checklist task completed", { sessionId, taskId, checklistId: checklist?.id });
+		return c.json({ session: sessionId, checklist });
+	} catch (error) {
+		const { message, status } = checklistError(error);
+		checklistLog.error("Checklist complete failed", error instanceof Error ? error : new Error(String(error)));
+		return c.json({ error: message }, status);
+	}
+});
+
+app.post("/api/sessions/:session/checklist/tasks/:task/skip", async (c) => {
+	const sessionId = c.req.param("session").trim();
+	const taskId = c.req.param("task").trim();
+
+	if (!sessionId || !taskId) {
+		return c.json({ error: "Session and task are required." }, 400);
+	}
+
+	const ctx = createContext();
+
+	if (ctx.error) {
+		const { message, status } = ctx.error;
+		checklistLog.error("Context creation failed", { status, message });
+		return c.json({ error: message }, status);
+	}
+
+	try {
+		const checklist = await skipChecklistTask(ctx.db, sessionId, taskId);
+		checklistLog.success("Checklist task skipped", { sessionId, taskId, checklistId: checklist?.id });
+		return c.json({ session: sessionId, checklist });
+	} catch (error) {
+		const { message, status } = checklistError(error);
+		checklistLog.error("Checklist skip failed", error instanceof Error ? error : new Error(String(error)));
+		return c.json({ error: message }, status);
+	}
+});
+
+app.post("/api/sessions/:session/checklist/reset", async (c) => {
+	const sessionId = c.req.param("session").trim();
+
+	if (!sessionId) {
+		return c.json({ error: "Session is required." }, 400);
+	}
+
+	const ctx = createContext();
+
+	if (ctx.error) {
+		const { message, status } = ctx.error;
+		checklistLog.error("Context creation failed", { status, message });
+		return c.json({ error: message }, status);
+	}
+
+	try {
+		const checklist = await resetChecklist(ctx.db, sessionId);
+		checklistLog.success("Checklist reset", { sessionId, checklistId: checklist?.id });
+		return c.json({ session: sessionId, checklist });
+	} catch (error) {
+		const { message, status } = checklistError(error);
+		checklistLog.error("Checklist reset failed", error instanceof Error ? error : new Error(String(error)));
+		return c.json({ error: message }, status);
+	}
+});
+
+app.post("/api/sessions/:session/checklist/abandon", async (c) => {
+	const sessionId = c.req.param("session").trim();
+
+	if (!sessionId) {
+		return c.json({ error: "Session is required." }, 400);
+	}
+
+	const ctx = createContext();
+
+	if (ctx.error) {
+		const { message, status } = ctx.error;
+		checklistLog.error("Context creation failed", { status, message });
+		return c.json({ error: message }, status);
+	}
+
+	try {
+		const checklist = await abandonChecklist(ctx.db, sessionId);
+		checklistLog.success("Checklist abandoned", { sessionId });
+		return c.json({ session: sessionId, checklist });
+	} catch (error) {
+		const { message, status } = checklistError(error);
+		checklistLog.error("Checklist abandon failed", error instanceof Error ? error : new Error(String(error)));
+		return c.json({ error: message }, status);
+	}
+});
+
 app.post("/api/ai/chat", async ({ req }) => {
 	let rawBody: unknown;
 
@@ -284,29 +539,178 @@ app.post("/api/ai/chat", async ({ req }) => {
 
 	const currentUserMessage: ModelMessage = { role: "user", content: userContent };
 	const attachedPageImageKeys = new Set<string>();
+	const heartbeat = createStreamHeartbeat(preparedSession.data.sessionId);
+	const sessionChecklist = await getSessionChecklist(ctx.db, preparedSession.data.sessionId);
+	const sessionTools = createTools({ db: ctx.db, sessionId: preparedSession.data.sessionId });
 
 	const result = streamText({
 		model: provider(ctx.data.modelId),
 		temperature: 0,
-		system: systemPrompt,
+		system: `${systemPrompt}\n\n${formatChecklistForPrompt(sessionChecklist)}`,
 		messages: [...preparedSession.data.prevMessages, currentUserMessage],
-		stopWhen: stepCountIs(4),
-		tools,
+		stopWhen: stepCountIs(10),
+		tools: sessionTools,
 		prepareStep: async ({ messages, steps }) => {
 			const messagesWithImages = await attachRequestedPageImages(ctx.db, messages, steps, attachedPageImageKeys);
-
 			if (!messagesWithImages) return undefined;
 
 			return {
 				messages: messagesWithImages,
-				activeTools: [],
 			};
 		},
+		experimental_onStart: ({ model, messages, tools }) => {
+			heartbeat.mark("started");
+			chatLog.info("AI stream started", {
+				sessionId: preparedSession.data.sessionId,
+				model: `${model.provider}/${model.modelId}`,
+				messages: messages?.length,
+				tools: tools ? Object.keys(tools).length : 0,
+			});
+		},
+		experimental_onStepStart: ({ stepNumber, messages }) => {
+			heartbeat.stepStarted(stepNumber);
+			chatLog.info("AI step started", {
+				sessionId: preparedSession.data.sessionId,
+				stepNumber,
+				messages: messages.length,
+			});
+		},
+		onChunk: ({ chunk }) => {
+			heartbeat.chunkReceived();
+
+			switch (chunk.type) {
+				case "text-delta": {
+					heartbeat.textDelta(chunk.text.length);
+					chatLog.debug("AI text delta", {
+						sessionId: preparedSession.data.sessionId,
+						deltaChars: chunk.text.length,
+					});
+					break;
+				}
+				case "reasoning-delta": {
+					heartbeat.reasoningDelta(chunk.text.length);
+					chatLog.debug("AI reasoning delta", {
+						sessionId: preparedSession.data.sessionId,
+						deltaChars: chunk.text.length,
+					});
+					break;
+				}
+				case "tool-input-start": {
+					heartbeat.mark("tool-input-start");
+					chatLog.info("AI tool input started", {
+						sessionId: preparedSession.data.sessionId,
+						toolName: chunk.toolName,
+					});
+					break;
+				}
+				case "tool-input-delta": {
+					heartbeat.mark("tool-input-delta");
+					chatLog.debug("AI tool input delta", {
+						sessionId: preparedSession.data.sessionId,
+						deltaChars: chunk.delta.length,
+					});
+					break;
+				}
+				case "tool-call": {
+					heartbeat.toolCallEmitted();
+					chatLog.info("AI tool call emitted", {
+						sessionId: preparedSession.data.sessionId,
+						toolName: chunk.toolName,
+						input: jsonSafe(chunk.input),
+					});
+					break;
+				}
+				case "tool-result": {
+					heartbeat.mark("tool-result");
+					chatLog.info("AI tool result emitted", {
+						sessionId: preparedSession.data.sessionId,
+						toolName: chunk.toolName,
+						output: summarizeToolOutput(chunk.output),
+					});
+					break;
+				}
+				case "source": {
+					heartbeat.mark("source");
+					chatLog.info("AI source emitted", {
+						sessionId: preparedSession.data.sessionId,
+						sourceType: chunk.sourceType,
+					});
+					break;
+				}
+				case "raw": {
+					heartbeat.mark("raw");
+					chatLog.debug("AI raw chunk emitted", {
+						sessionId: preparedSession.data.sessionId,
+					});
+					break;
+				}
+			}
+		},
+		experimental_onToolCallStart: ({ stepNumber, toolCall }) => {
+			heartbeat.toolExecutionStarted();
+			chatLog.info("AI tool execution started", {
+				sessionId: preparedSession.data.sessionId,
+				stepNumber,
+				toolName: toolCall.toolName,
+				input: jsonSafe(toolCall.input),
+			});
+		},
+		experimental_onToolCallFinish: (event) => {
+			heartbeat.mark("tool-finish");
+
+			const context = {
+				sessionId: preparedSession.data.sessionId,
+				stepNumber: event.stepNumber,
+				toolName: event.toolCall.toolName,
+				durationMs: Math.round(event.durationMs),
+				success: event.success,
+			};
+
+			if (event.success) {
+				chatLog.success("AI tool execution finished", {
+					...context,
+					output: summarizeToolOutput(event.output),
+				});
+				return;
+			}
+
+			chatLog.error(
+				"AI tool execution failed",
+				event.error instanceof Error ? event.error : new Error(String(event.error)),
+			);
+		},
+		onError: ({ error }) => {
+			heartbeat.mark("error");
+			heartbeat.stop();
+			chatLog.error("AI stream error", error instanceof Error ? error : new Error(String(error)));
+		},
+		onAbort: ({ steps }) => {
+			heartbeat.mark("aborted");
+			heartbeat.stop();
+			chatLog.warn("AI stream aborted", {
+				sessionId: preparedSession.data.sessionId,
+				steps: steps.length,
+				elapsedMs: heartbeat.elapsedMs(),
+			});
+		},
 		onStepFinish: (event) => {
-			const { model, content, toolCalls } = event;
-			log.success("Step finished", { model, content, toolCalls });
+			const { model, finishReason, reasoningText, text, toolCalls, toolResults, usage } = event;
+			heartbeat.mark("step-finish");
+			log.success("Step finished", {
+				sessionId: preparedSession.data.sessionId,
+				model,
+				finishReason,
+				textChars: text.length,
+				reasoningChars: reasoningText?.length ?? 0,
+				toolCalls: toolCalls.length,
+				toolResults: toolResults.length,
+				usage,
+			});
+			log.debug("Step content", { content: event.content });
 		},
 		onFinish: async ({ content, sources, usage, totalUsage, toolCalls, steps, finishReason, text }) => {
+			heartbeat.mark("finish");
+			heartbeat.stop();
 			log.info("Finish Reason:", { finishReason });
 			log.success("Stream finished:", { content, sources, steps, usage });
 			log.info("Tool calls:", { toolCalls });
@@ -342,9 +746,12 @@ app.post("/api/ai/chat", async ({ req }) => {
 		},
 	});
 
+	heartbeat.start();
 	chatLog.success("Chat stream created", { model: ctx.data.modelId, provider: ctx.data.providerName });
 
-	return result.toTextStreamResponse();
+	return result.toUIMessageStreamResponse({
+		sendReasoning: true,
+	});
 });
 
 const ragSearchSchema = z.object({
