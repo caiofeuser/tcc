@@ -24,6 +24,7 @@ import { findRelevantContent } from "./ai/tools/find-relevant-content.js";
 import type { PageImageToolOutput } from "./ai/tools/get-image.js";
 import { createTools } from "./ai/tools/index.js";
 import { validate } from "./ai/validation/validate.js";
+import { transcriptionRoutes } from "./transcription/routes.js";
 
 const app = new Hono({});
 const log = createLogger("api");
@@ -296,6 +297,8 @@ app.get("/", serveStatic({ root: "./public", path: "index.html" }));
 app.get("/health", (c) => {
 	return c.json({ status: "ok" });
 });
+
+app.route("/api/transcriptions", transcriptionRoutes);
 
 app.get("/api/sessions/:session/messages", async (c) => {
 	const sessionId = c.req.param("session").trim();

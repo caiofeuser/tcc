@@ -1,0 +1,47 @@
+FROM ubuntu:24.04 AS builder
+
+ARG WHISPER_CPP_VERSION=v1.9.1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        git \
+        wget \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt
+
+RUN git clone --branch "${WHISPER_CPP_VERSION}" --depth 1 \
+    https://github.com/ggml-org/whisper.cpp.git
+
+WORKDIR /opt/whisper.cpp
+
+RUN cmake -S . -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_NATIVE=OFF \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DWHISPER_BUILD_TESTS=OFF \
+        -DWHISPER_BUILD_EXAMPLES=ON \
+        -DWHISPER_BUILD_SERVER=ON \
+    && cmake --build build --target whisper-server -j "$(nproc)"
+
+RUN ./models/download-ggml-model.sh base.en
+
+FROM ubuntu:24.04 AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/whisper.cpp/build/bin/whisper-server /usr/local/bin/whisper-server
+COPY --from=builder /opt/whisper.cpp/models/ggml-base.en.bin /models/ggml-base.en.bin
+
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/whisper-server"]
+CMD ["--host", "0.0.0.0", "--port", "8080", "--model", "/models/ggml-base.en.bin"]

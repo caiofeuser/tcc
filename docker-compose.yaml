@@ -32,10 +32,14 @@ services:
     environment:
       # Inside Compose, Postgres is reachable as service `db`; host tools use localhost:5433.
       DATABASE_URL: postgres://postgres:example@db:5432/postgres
+      WHISPER_BASE_URL: http://whisper:8080
       FORCE_COLOR: "1"
       TERM: xterm-256color
     depends_on:
-      - db
+      db:
+        condition: service_started
+      whisper:
+        condition: service_healthy
     ports:
       - "3000:3000"
     # deploy:
@@ -45,6 +49,7 @@ services:
     #         - driver: nvidia
     #           count: all
     #           capabilities: [gpu]
+    #           
     develop:
       watch:
         - action: sync
@@ -73,6 +78,19 @@ services:
 
         - action: rebuild
           path: ./Dockerfile
+  whisper:
+    build:
+      context: .
+      dockerfile: Dockerfile.whisper
+    restart: unless-stopped
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
 volumes:
   postgres_data:
