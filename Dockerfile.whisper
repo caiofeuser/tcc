@@ -35,6 +35,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        ffmpeg \
         libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -44,4 +45,4 @@ COPY --from=builder /opt/whisper.cpp/models/ggml-base.en.bin /models/ggml-base.e
 EXPOSE 8080
 
 ENTRYPOINT ["/usr/local/bin/whisper-server"]
-CMD ["--host", "0.0.0.0", "--port", "8080", "--model", "/models/ggml-base.en.bin"]
+CMD ["--host", "0.0.0.0", "--port", "8080", "--model", "/models/ggml-base.en.bin", "--convert"]

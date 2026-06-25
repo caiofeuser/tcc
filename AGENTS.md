@@ -11,11 +11,13 @@ USE BUN NOT PNPM!
 
 Before planning, writing, or changing anything related to the bachelor thesis, read:
 
-`/Users/caiofeuser/Library/Mobile Documents/iCloud~md~obsidian/Documents/Default/1-Quick Notes/TCC Codex Memory.md`
+`./TCC Codex Memory.md`
 
 Use it as the source of truth for thesis direction, official objectives, scope, repositories, robot/manual/client context, assumptions, and next actions.
 
 If memory conflicts with a newer user message, follow the newer user message. Update memory only when instructed.
+
+Keep the memory synchronized with `../vuzix-smartglass-app/TCC Codex Memory.md`. When instructed to update either copy, apply the same update to both files in the same change and verify that their contents remain identical.
 
 Separate official thesis text from internal planning notes.
 

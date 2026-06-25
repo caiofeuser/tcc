@@ -33,6 +33,8 @@ services:
       # Inside Compose, Postgres is reachable as service `db`; host tools use localhost:5433.
       DATABASE_URL: postgres://postgres:example@db:5432/postgres
       WHISPER_BASE_URL: http://whisper:8080
+      APP_PORT: "3000"
+      LOG_TRANSCRIPTS: "true"
       FORCE_COLOR: "1"
       TERM: xterm-256color
     depends_on:
@@ -41,7 +43,7 @@ services:
       whisper:
         condition: service_healthy
     ports:
-      - "3000:3000"
+      - "0.0.0.0:3000:3000"
     # deploy:
     #   resources:
     #     reservations:

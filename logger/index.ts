@@ -55,8 +55,22 @@ function formatDuration(durationMs: number) {
 	return `${(durationMs / 1000).toFixed(1)}s`;
 }
 
+function formatError(error: Error) {
+	const chain: string[] = [];
+	const visited = new Set<Error>();
+	let current: Error | undefined = error;
+
+	while (current && !visited.has(current) && chain.length < 5) {
+		visited.add(current);
+		chain.push(`${current.name}: ${current.message}`);
+		current = current.cause instanceof Error ? current.cause : undefined;
+	}
+
+	return chain.join(" causedBy=");
+}
+
 function formatValue(value: unknown) {
-	if (value instanceof Error) return `${value.name}: ${value.message}`;
+	if (value instanceof Error) return formatError(value);
 	if (typeof value === "string") return /\s/.test(value) ? JSON.stringify(value) : value;
 	if (typeof value === "number" || typeof value === "boolean" || value === null) return String(value);
 	if (value === undefined) return undefined;

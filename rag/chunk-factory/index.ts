@@ -13,8 +13,8 @@ const log = createLogger("rag:chunk-factory");
 
 type PdfCanvasFactory = {
 	create: (
-		width: number,
 		height: number,
+		width: number,
 	) => {
 		canvas: { toBuffer: (type: "image/png") => Buffer };
 		context: CanvasRenderingContext2D;
@@ -119,12 +119,13 @@ export async function ingestPDF(filePath: string, dryRun: boolean) {
 
 		log.success("Document registered", { documentId: document.id, title });
 
-		for (let pageNumber = 34; pageNumber <= pdf.numPages; pageNumber++) {
+		for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
 			let index = 0;
 			const pageTimer = log.timer();
 			log.info("Processing page", { page: pageNumber, totalPages: pdf.numPages });
 
 			const pageContent = await getPageContent(pageNumber, pdf);
+			console.log(pageContent);
 			const text = extractPageText(pageContent);
 			log.debug("Page text extracted", { page: pageNumber, chars: text.length });
 

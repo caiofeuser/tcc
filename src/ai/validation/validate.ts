@@ -7,6 +7,8 @@ const chatRequestSchema = z.object({
 	imageMediaType: z.string().trim().min(1).optional(),
 });
 
+export type ChatRequestData = z.infer<typeof chatRequestSchema>;
+
 export function validate(req: unknown) {
 	const parsed = chatRequestSchema.safeParse(req);
 

@@ -21,13 +21,13 @@ export class WhisperTranscriptionService {
 		private readonly timeoutMs = 60_000,
 	) {}
 
-	async transcribe(audio: Blob): Promise<string> {
+	async transcribe(audio: File): Promise<string> {
 		if (!this.baseUrl) {
 			throw new WhisperTranscriptionError("Whisper is not configured", 503);
 		}
 
 		const form = new FormData();
-		form.append("file", audio, "recording.wav");
+		form.append("file", audio, audio.name);
 		form.append("response_format", "json");
 		form.append("language", "en");
 

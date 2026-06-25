@@ -23,15 +23,23 @@ import { prepareSession } from "./ai/session/prepare-session.js";
 import { findRelevantContent } from "./ai/tools/find-relevant-content.js";
 import type { PageImageToolOutput } from "./ai/tools/get-image.js";
 import { createTools } from "./ai/tools/index.js";
-import { validate } from "./ai/validation/validate.js";
-import { transcriptionRoutes } from "./transcription/routes.js";
+import { type ChatRequestData, validate } from "./ai/validation/validate.js";
+import { TranscriptionInputError, transcribeAudio } from "./transcription/service.js";
+import { WhisperTranscriptionError } from "./transcription/whisper.js";
 
-const app = new Hono({});
+type AppEnvironment = {
+	Variables: {
+		requestId: string;
+	};
+};
+
+const app = new Hono<AppEnvironment>({});
 const log = createLogger("api");
 const chatLog = createLogger("api:chat");
 const ragLog = createLogger("api:rag");
 const sessionLog = createLogger("api:session");
 const checklistLog = createLogger("api:checklist");
+const shouldLogTranscripts = ["1", "true", "yes"].includes(process.env.LOG_TRANSCRIPTS?.toLowerCase() ?? "");
 
 type SelectableDatabase = Pick<ReturnType<typeof createContext>["db"], "select">;
 
@@ -56,6 +64,14 @@ function jsonSafe(value: unknown) {
 
 function withoutUndefined(metadata: Record<string, unknown>) {
 	return Object.fromEntries(Object.entries(metadata).filter(([, value]) => value !== undefined));
+}
+
+function jsonError(message: string, status: number) {
+	return Response.json({ error: message }, { status });
+}
+
+function publicError(message: string, status: number, fallback: string) {
+	return status >= 500 ? fallback : message;
 }
 
 function summarizeToolCalls(toolCalls: readonly unknown[]) {
@@ -269,19 +285,25 @@ const systemPrompt = dedent(`
 app.use(async (c, next) => {
 	const path = new URL(c.req.url).pathname;
 	const method = c.req.method;
+	const incomingRequestId = c.req.header("X-Request-Id")?.trim();
+	const requestId = incomingRequestId && incomingRequestId.length <= 128 ? incomingRequestId : crypto.randomUUID();
 	const timer = log.timer();
 
-	if (path !== "/health") log.info("Request started", { method, path });
+	c.set("requestId", requestId);
+	c.header("X-Request-Id", requestId);
+
+	if (path !== "/health") log.info("Request started", { requestId, method, path });
 
 	try {
 		await next();
 
 		if (path !== "/health") {
-			timer.done("Request completed", { method, path, status: c.res.status });
+			timer.done("Request completed", { requestId, method, path, status: c.res.status });
 		}
 	} catch (error) {
 		if (path !== "/health") {
 			timer.fail("Request failed", {
+				requestId,
 				method,
 				path,
 				error: error instanceof Error ? error.message : String(error),
@@ -298,8 +320,6 @@ app.get("/health", (c) => {
 	return c.json({ status: "ok" });
 });
 
-app.route("/api/transcriptions", transcriptionRoutes);
-
 app.get("/api/sessions/:session/messages", async (c) => {
 	const sessionId = c.req.param("session").trim();
 
@@ -313,7 +333,7 @@ app.get("/api/sessions/:session/messages", async (c) => {
 	if (ctx.error) {
 		const { message, status } = ctx.error;
 		sessionLog.error("Context creation failed", { status, message });
-		return c.json({ error: message }, status);
+		return c.json({ error: publicError(message, status, "Session service is unavailable.") }, status);
 	}
 
 	try {
@@ -330,7 +350,7 @@ app.get("/api/sessions/:session/messages", async (c) => {
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		sessionLog.error("Failed to load session messages", error instanceof Error ? error : new Error(String(error)));
-		return c.json({ error: message }, 500);
+		return c.json({ error: "Session messages could not be loaded." }, 500);
 	}
 });
 
@@ -358,7 +378,7 @@ app.get("/api/sessions/:session/checklist", async (c) => {
 	if (ctx.error) {
 		const { message, status } = ctx.error;
 		checklistLog.error("Context creation failed", { status, message });
-		return c.json({ error: message }, status);
+		return c.json({ error: publicError(message, status, "Checklist service is unavailable.") }, status);
 	}
 
 	try {
@@ -368,7 +388,7 @@ app.get("/api/sessions/:session/checklist", async (c) => {
 	} catch (error) {
 		const { message, status } = checklistError(error);
 		checklistLog.error("Checklist load failed", error instanceof Error ? error : new Error(String(error)));
-		return c.json({ error: message }, status);
+		return c.json({ error: publicError(message, status, "Checklist could not be loaded.") }, status);
 	}
 });
 
@@ -385,7 +405,7 @@ app.post("/api/sessions/:session/checklist/tasks/:task/complete", async (c) => {
 	if (ctx.error) {
 		const { message, status } = ctx.error;
 		checklistLog.error("Context creation failed", { status, message });
-		return c.json({ error: message }, status);
+		return c.json({ error: publicError(message, status, "Checklist service is unavailable.") }, status);
 	}
 
 	try {
@@ -395,7 +415,7 @@ app.post("/api/sessions/:session/checklist/tasks/:task/complete", async (c) => {
 	} catch (error) {
 		const { message, status } = checklistError(error);
 		checklistLog.error("Checklist complete failed", error instanceof Error ? error : new Error(String(error)));
-		return c.json({ error: message }, status);
+		return c.json({ error: publicError(message, status, "Checklist step could not be completed.") }, status);
 	}
 });
 
@@ -412,7 +432,7 @@ app.post("/api/sessions/:session/checklist/tasks/:task/skip", async (c) => {
 	if (ctx.error) {
 		const { message, status } = ctx.error;
 		checklistLog.error("Context creation failed", { status, message });
-		return c.json({ error: message }, status);
+		return c.json({ error: publicError(message, status, "Checklist service is unavailable.") }, status);
 	}
 
 	try {
@@ -422,7 +442,7 @@ app.post("/api/sessions/:session/checklist/tasks/:task/skip", async (c) => {
 	} catch (error) {
 		const { message, status } = checklistError(error);
 		checklistLog.error("Checklist skip failed", error instanceof Error ? error : new Error(String(error)));
-		return c.json({ error: message }, status);
+		return c.json({ error: publicError(message, status, "Checklist step could not be skipped.") }, status);
 	}
 });
 
@@ -438,7 +458,7 @@ app.post("/api/sessions/:session/checklist/reset", async (c) => {
 	if (ctx.error) {
 		const { message, status } = ctx.error;
 		checklistLog.error("Context creation failed", { status, message });
-		return c.json({ error: message }, status);
+		return c.json({ error: publicError(message, status, "Checklist service is unavailable.") }, status);
 	}
 
 	try {
@@ -448,7 +468,7 @@ app.post("/api/sessions/:session/checklist/reset", async (c) => {
 	} catch (error) {
 		const { message, status } = checklistError(error);
 		checklistLog.error("Checklist reset failed", error instanceof Error ? error : new Error(String(error)));
-		return c.json({ error: message }, status);
+		return c.json({ error: publicError(message, status, "Checklist could not be reset.") }, status);
 	}
 });
 
@@ -464,7 +484,7 @@ app.post("/api/sessions/:session/checklist/abandon", async (c) => {
 	if (ctx.error) {
 		const { message, status } = ctx.error;
 		checklistLog.error("Context creation failed", { status, message });
-		return c.json({ error: message }, status);
+		return c.json({ error: publicError(message, status, "Checklist service is unavailable.") }, status);
 	}
 
 	try {
@@ -474,18 +494,19 @@ app.post("/api/sessions/:session/checklist/abandon", async (c) => {
 	} catch (error) {
 		const { message, status } = checklistError(error);
 		checklistLog.error("Checklist abandon failed", error instanceof Error ? error : new Error(String(error)));
-		return c.json({ error: message }, status);
+		return c.json({ error: publicError(message, status, "Checklist could not be abandoned.") }, status);
 	}
 });
 
-app.post("/api/ai/chat", async ({ req }) => {
+app.post("/api/ai/chat", async (c) => {
+	const { req } = c;
 	let rawBody: unknown;
 
 	try {
 		rawBody = await req.json();
 	} catch (e) {
 		chatLog.warn("Invalid JSON body", e instanceof Error ? e : new Error(String(e)));
-		return new Response(`Bad request: ${e}`, { status: 401 });
+		return jsonError("Request body must be valid JSON.", 400);
 	}
 
 	const { data, error } = validate(rawBody);
@@ -493,28 +514,38 @@ app.post("/api/ai/chat", async ({ req }) => {
 	if (error) {
 		const { message, status } = error;
 		chatLog.warn("Request validation failed", { status, message });
-		return new Response(`Bad request: ${message}`, { status });
+		return jsonError("Chat request is invalid.", status);
 	}
 
-	chatLog.info("Chat request accepted", { messageLength: data.message.length });
+	return streamChat(data, c.get("requestId"));
+});
+
+async function streamChat(data: ChatRequestData, requestId: string) {
+	chatLog.info("Chat request accepted", {
+		requestId,
+		sessionId: data.session,
+		messageLength: data.message.length,
+		hasImage: Boolean(data.imageBase64),
+	});
 
 	const ctx = createContext();
 
 	if (ctx.error) {
 		const { message, status } = ctx.error;
-		chatLog.error("Context creation failed", { status, message });
-		return new Response(`Bad request: ${message}`, { status });
+		chatLog.error("Context creation failed", { requestId, status, message });
+		return jsonError(publicError(String(message), status, "Assistant configuration is unavailable."), status);
 	}
 
 	const preparedSession = await prepareSession(ctx, data);
 
 	if (preparedSession.error) {
 		const { message, status } = preparedSession.error;
-		chatLog.error("Session preparation failed", { status, message });
-		return new Response(`Bad request: ${message}`, { status });
+		chatLog.error("Session preparation failed", { requestId, status, message });
+		return jsonError(publicError(String(message), status, "Assistant session could not be prepared."), status);
 	}
 
 	chatLog.debug("Session prepared", {
+		requestId,
 		sessionId: preparedSession.data.sessionId,
 		previousMessages: preparedSession.data.prevMessages.length,
 	});
@@ -543,6 +574,7 @@ app.post("/api/ai/chat", async ({ req }) => {
 	const currentUserMessage: ModelMessage = { role: "user", content: userContent };
 	const attachedPageImageKeys = new Set<string>();
 	const heartbeat = createStreamHeartbeat(preparedSession.data.sessionId);
+	let firstTextReceived = false;
 	const sessionChecklist = await getSessionChecklist(ctx.db, preparedSession.data.sessionId);
 	const sessionTools = createTools({ db: ctx.db, sessionId: preparedSession.data.sessionId });
 
@@ -564,6 +596,7 @@ app.post("/api/ai/chat", async ({ req }) => {
 		experimental_onStart: ({ model, messages, tools }) => {
 			heartbeat.mark("started");
 			chatLog.info("AI stream started", {
+				requestId,
 				sessionId: preparedSession.data.sessionId,
 				model: `${model.provider}/${model.modelId}`,
 				messages: messages?.length,
@@ -584,6 +617,14 @@ app.post("/api/ai/chat", async ({ req }) => {
 			switch (chunk.type) {
 				case "text-delta": {
 					heartbeat.textDelta(chunk.text.length);
+					if (!firstTextReceived) {
+						firstTextReceived = true;
+						chatLog.info("First assistant text received", {
+							requestId,
+							sessionId: preparedSession.data.sessionId,
+							elapsedMs: heartbeat.elapsedMs(),
+						});
+					}
 					chatLog.debug("AI text delta", {
 						sessionId: preparedSession.data.sessionId,
 						deltaChars: chunk.text.length,
@@ -685,12 +726,18 @@ app.post("/api/ai/chat", async ({ req }) => {
 		onError: ({ error }) => {
 			heartbeat.mark("error");
 			heartbeat.stop();
-			chatLog.error("AI stream error", error instanceof Error ? error : new Error(String(error)));
+			chatLog.error("AI stream error", {
+				requestId,
+				sessionId: preparedSession.data.sessionId,
+				error: error instanceof Error ? error.message : String(error),
+				elapsedMs: heartbeat.elapsedMs(),
+			});
 		},
 		onAbort: ({ steps }) => {
 			heartbeat.mark("aborted");
 			heartbeat.stop();
 			chatLog.warn("AI stream aborted", {
+				requestId,
 				sessionId: preparedSession.data.sessionId,
 				steps: steps.length,
 				elapsedMs: heartbeat.elapsedMs(),
@@ -715,6 +762,14 @@ app.post("/api/ai/chat", async ({ req }) => {
 			heartbeat.mark("finish");
 			heartbeat.stop();
 			log.info("Finish Reason:", { finishReason });
+			chatLog.success("AI stream completed", {
+				requestId,
+				sessionId: preparedSession.data.sessionId,
+				finishReason,
+				textChars: text.length,
+				steps: steps.length,
+				elapsedMs: heartbeat.elapsedMs(),
+			});
 			log.success("Stream finished:", { content, sources, steps, usage });
 			log.info("Tool calls:", { toolCalls });
 			log.debug("Content:", { content });
@@ -740,6 +795,7 @@ app.post("/api/ai/chat", async ({ req }) => {
 				});
 
 				chatLog.success("Chat turn persisted", {
+					requestId,
 					sessionId: preparedSession.data.sessionId,
 					assistantMessageLength: text.length,
 				});
@@ -750,11 +806,119 @@ app.post("/api/ai/chat", async ({ req }) => {
 	});
 
 	heartbeat.start();
-	chatLog.success("Chat stream created", { model: ctx.data.modelId, provider: ctx.data.providerName });
+	chatLog.success("Chat stream created", {
+		requestId,
+		sessionId: preparedSession.data.sessionId,
+		model: ctx.data.modelId,
+		provider: ctx.data.providerName,
+	});
 
 	return result.toUIMessageStreamResponse({
 		sendReasoning: true,
 	});
+}
+
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const SUPPORTED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+
+app.post("/api/ai/questions", async (c) => {
+	const requestId = c.get("requestId");
+	let body: Awaited<ReturnType<typeof c.req.parseBody>>;
+
+	try {
+		body = await c.req.parseBody();
+	} catch (error) {
+		chatLog.warn("Invalid voice-question multipart body", error instanceof Error ? error : new Error(String(error)));
+		return c.json({ error: "Expected multipart/form-data" }, 400);
+	}
+
+	const session = typeof body.session === "string" ? body.session.trim() : "";
+	const image = body.image;
+
+	if (!session) {
+		return c.json({ error: "Session is required in the 'session' field" }, 400);
+	}
+
+	if (!(image instanceof File) || image.size === 0) {
+		return c.json({ error: "Image is required in the 'image' field" }, 400);
+	}
+
+	if (image.size > MAX_IMAGE_BYTES) {
+		return c.json({ error: "Image file exceeds the 10 MB limit" }, 413);
+	}
+
+	if (!SUPPORTED_IMAGE_TYPES.has(image.type)) {
+		return c.json({ error: "Image must be JPEG, PNG, or WebP" }, 415);
+	}
+
+	chatLog.info("Voice question upload accepted", {
+		requestId,
+		sessionId: session,
+		audioBytes: body.audio instanceof File ? body.audio.size : 0,
+		imageBytes: image.size,
+		imageType: image.type,
+	});
+
+	let transcript: string;
+	const transcriptionStartedAt = performance.now();
+
+	try {
+		transcript = await transcribeAudio(body.audio);
+		chatLog.success("Voice transcription completed", {
+			requestId,
+			sessionId: session,
+			transcriptChars: transcript.length,
+			durationMs: Math.round(performance.now() - transcriptionStartedAt),
+		});
+
+		if (shouldLogTranscripts) {
+			chatLog.info("Whisper transcript", {
+				requestId,
+				sessionId: session,
+				transcript: transcript.slice(0, 1000),
+				truncated: transcript.length > 1000,
+			});
+		}
+	} catch (error) {
+		if (error instanceof TranscriptionInputError || error instanceof WhisperTranscriptionError) {
+			chatLog.warn("Voice transcription rejected", {
+				requestId,
+				sessionId: session,
+				status: error.status,
+				error: error.message,
+				durationMs: Math.round(performance.now() - transcriptionStartedAt),
+			});
+			return c.json({ error: error.message }, error.status);
+		}
+
+		chatLog.error("Voice-question transcription failed", {
+			requestId,
+			sessionId: session,
+			error: error instanceof Error ? error.message : String(error),
+			durationMs: Math.round(performance.now() - transcriptionStartedAt),
+		});
+		return c.json({ error: "Transcription failed" }, 500);
+	}
+
+	const imageBase64 = Buffer.from(await image.arrayBuffer()).toString("base64");
+
+	chatLog.info("Voice question prepared", {
+		requestId,
+		sessionId: session,
+		audioBytes: body.audio instanceof File ? body.audio.size : 0,
+		imageBytes: image.size,
+		transcriptChars: transcript.length,
+	});
+
+	return streamChat(
+		{
+			session,
+			message: transcript,
+			imageBase64,
+			imageMediaType: image.type,
+		},
+		requestId,
+	);
 });
 
 const ragSearchSchema = z.object({
@@ -791,12 +955,13 @@ const config = {
 	fetch(req, server) {
 		const path = new URL(req.url).pathname;
 
-		if (path === "/api/ai/chat") {
+		if (path === "/api/ai/chat" || path === "/api/ai/questions") {
 			server.timeout(req, 0);
 		}
 
 		return app.fetch(req);
 	},
+	hostname: "0.0.0.0",
 	port: Number(process.env.APP_PORT ?? 3000),
 	idleTimeout: 255,
 } satisfies Bun.Serve.Options<undefined, never>;
