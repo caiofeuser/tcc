@@ -459,7 +459,9 @@
       for (const button of buttons) button.disabled = isBusy;
 
       if (!isBusy) {
-        const canAdvance = currentChecklist?.status === "active" && Boolean(currentChecklist.currentTask);
+        const canAdvance =
+          currentChecklist?.status === "active" &&
+          currentChecklist.currentTask?.status === "pending";
         checklistCompleteEl.disabled = !canAdvance;
         checklistSkipEl.disabled = !canAdvance;
         checklistResetEl.disabled = !currentChecklist;
@@ -535,7 +537,7 @@
         checklistTasksEl.append(item);
       }
 
-      const canAdvance = checklist.status === "active" && Boolean(currentTask);
+      const canAdvance = checklist.status === "active" && currentTask?.status === "pending";
       checklistCompleteEl.disabled = !canAdvance;
       checklistSkipEl.disabled = !canAdvance;
       checklistResetEl.disabled = false;

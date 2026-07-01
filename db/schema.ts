@@ -40,6 +40,7 @@ export const checklists = p.pgTable(
 		sourceQuestion: p.text("source_question").notNull(),
 		status: STATUS_ENUM().notNull().default("active"),
 		currentTaskIndex: p.integer("current_task_index").notNull().default(0),
+		dismissedAt: p.timestamp("dismissed_at"),
 		metadata: p.jsonb().$type<Record<string, unknown>>().default({}),
 		...temporals,
 	},

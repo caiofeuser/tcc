@@ -1,7 +1,7 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { images } from "@db/schema.js";
 import { createLogger } from "@log/index.js";
-import { type ModelMessage, stepCountIs, streamText, type UserContent } from "ai";
+import { hasToolCall, type ModelMessage, stepCountIs, streamText, type UserContent } from "ai";
 import dedent from "dedent";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
@@ -12,6 +12,7 @@ import {
 	type ChecklistErrorStatus,
 	ChecklistStateError,
 	completeChecklistTask,
+	finishChecklist,
 	formatChecklistForPrompt,
 	getSessionChecklist,
 	resetChecklist,
@@ -254,6 +255,7 @@ const systemPrompt = dedent(`
   Retrieval:
   - For robot operation, TP3 usage, coordinate movement, setup, errors, safety, or procedures, call getInformation first.
   - If retrieved context is missing, weak, or unrelated, say that clearly or ask one focused clarification question.
+  - Checklist-control commands are state transitions, not information requests. Do not call getInformation for them.
 
   Guided procedure decision:
   - A guided procedure is required whenever the answer would contain two or more ordered operator actions.
@@ -265,15 +267,28 @@ const systemPrompt = dedent(`
   2. After receiving the retrieved manual context, decide whether the answer requires two or more ordered operator actions.
   3. If it is multi-step, do not output the procedure as text, bullets, numbered actions, or operator instructions.
   4. If it is multi-step, only call startGuidedProcedure with operatorActions grounded in the retrieved context.
-  5. After startGuidedProcedure succeeds, only tell the operator that the guided procedure was started and state the current first action.
+  5. startGuidedProcedure is terminal for the current turn. Do not generate text after calling it; the application renders the checklist.
 
   Post-retrieval rule:
   - After getInformation returns, if the operator is asking how to do a robot/TP3 operation and the retrieved context contains multiple ordered actions, your next assistant action must be startGuidedProcedure.
   - In that case, do not produce natural-language procedure text before calling startGuidedProcedure.
 
-  Active guided procedure:
-  - If an active guided procedure exists, use it as the source of task state.
-  - Do not advance, skip, reset, or complete actions in text. The backend/UI owns progression.
+  Checklist clarification and revision:
+  - If the operator cannot locate a button or understand the displayed pending action, inspect the current image and use getInformation when documentation is needed.
+  - If the existing instruction is valid but unclear, explain it more precisely without changing the checklist.
+  - If image or retrieved manual evidence proves the displayed pending instruction is wrong or incompatible, call revisePendingSteps with a complete coherent replacement for the current and future pending actions.
+  - Never revise completed or skipped actions, and never revise merely to rephrase a valid instruction.
+  - revisePendingSteps is terminal for the current turn. Do not generate text after calling it; the application renders the revised checklist.
+
+  Visible guided procedure:
+  - If a visible guided procedure exists, use it as the source of task state.
+  - For "complete", "done", or "next step", call advanceGuidedProcedure.
+  - For "go back" or "previous step", call showPreviousStep. This reviews history without undoing results.
+  - For an explicit skip request, call skipCurrentStep.
+  - For "finish" after checklist completion, call endGuidedProcedure with outcome "finish".
+  - For an explicit cancel, stop, or abandon request while active, call endGuidedProcedure with outcome "abandon".
+  - Never claim that one of these state changes happened without calling its tool.
+  - Checklist-control tools are terminal for the current turn. Do not generate text after calling one; the application renders the result.
 
   Answer style:
   - Be concise, grounded, and operational.
@@ -498,6 +513,32 @@ app.post("/api/sessions/:session/checklist/abandon", async (c) => {
 	}
 });
 
+app.post("/api/sessions/:session/checklist/finish", async (c) => {
+	const sessionId = c.req.param("session").trim();
+
+	if (!sessionId) {
+		return c.json({ error: "Session is required." }, 400);
+	}
+
+	const ctx = createContext();
+
+	if (ctx.error) {
+		const { message, status } = ctx.error;
+		checklistLog.error("Context creation failed", { status, message });
+		return c.json({ error: publicError(message, status, "Checklist service is unavailable.") }, status);
+	}
+
+	try {
+		const checklist = await finishChecklist(ctx.db, sessionId);
+		checklistLog.success("Checklist finished", { sessionId });
+		return c.json({ session: sessionId, checklist });
+	} catch (error) {
+		const { message, status } = checklistError(error);
+		checklistLog.error("Checklist finish failed", error instanceof Error ? error : new Error(String(error)));
+		return c.json({ error: publicError(message, status, "Checklist could not be finished.") }, status);
+	}
+});
+
 app.post("/api/ai/chat", async (c) => {
 	const { req } = c;
 	let rawBody: unknown;
@@ -581,9 +622,22 @@ async function streamChat(data: ChatRequestData, requestId: string) {
 	const result = streamText({
 		model: provider(ctx.data.modelId),
 		temperature: 0,
+		maxOutputTokens: 2048,
+		timeout: {
+			totalMs: 45_000,
+			stepMs: 30_000,
+		},
 		system: `${systemPrompt}\n\n${formatChecklistForPrompt(sessionChecklist)}`,
 		messages: [...preparedSession.data.prevMessages, currentUserMessage],
-		stopWhen: stepCountIs(10),
+		stopWhen: [
+			stepCountIs(10),
+			hasToolCall("startGuidedProcedure"),
+			hasToolCall("advanceGuidedProcedure"),
+			hasToolCall("showPreviousStep"),
+			hasToolCall("skipCurrentStep"),
+			hasToolCall("revisePendingSteps"),
+			hasToolCall("endGuidedProcedure"),
+		],
 		tools: sessionTools,
 		prepareStep: async ({ messages, steps }) => {
 			const messagesWithImages = await attachRequestedPageImages(ctx.db, messages, steps, attachedPageImageKeys);
@@ -756,6 +810,12 @@ async function streamChat(data: ChatRequestData, requestId: string) {
 				toolResults: toolResults.length,
 				usage,
 			});
+			if (reasoningText) {
+				chatLog.info("Model reasoning", {
+					sessionId: preparedSession.data.sessionId,
+					reasoning: reasoningText,
+				});
+			}
 			log.debug("Step content", { content: event.content });
 		},
 		onFinish: async ({ content, sources, usage, totalUsage, toolCalls, steps, finishReason, text }) => {
